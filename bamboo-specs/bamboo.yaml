@@ -1,0 +1,596 @@
+# ─── PIPELINE CONFIG ───────────────────────────────────────────────
+# Vendored from container-build-template. Edit only when adding /
+# removing pipeline jobs. Behavioural knobs live in image.env.
+# ───────────────────────────────────────────────────────────────────
+#
+# Atlassian YAML Specs v2 (NOT the reecetech dialect — that uses
+# `type: SCRIPT` + `body: |`, this uses `script:` + `scripts: -`).
+#
+# 1:1 parity with .gitlab-ci.yml. Same stages, same scripts/build.sh
+# entry point, same SBOM → Grype → Xray → Cosign → Ingest flow.
+# Runs on a Bamboo agent with docker installed (system.docker.executable
+# capability) — no dind dance needed.
+#
+# ── HOW PLAN VARIABLES FLOW INTO build.sh ────────────────────────────
+# Bamboo exposes plan vars + global vars to script tasks as env vars
+# prefixed `bamboo_` (dots → underscores). build.sh auto-imports every
+# `bamboo_*` env var as the bare name BEFORE sourcing image.env, so a
+# plan var named `VENDOR` automatically becomes `VENDOR`.
+#
+# That auto-import only handles exact-name matches. For globally shared
+# service-account vars whose Bamboo names DIFFER from what build.sh
+# expects (e.g. global `svc_artifactory_token` vs `ARTIFACTORY_TOKEN`),
+# add a one-line export shim — see the Build job below.
+#
+# Keep SECRETS in plan vars (encrypted). Keep behavioural toggles in
+# image.env (committed). See image.env.example for the full var list.
+#
+# ── BUILD_DEBUG ──────────────────────────────────────────────────────
+# Add plan variable BUILD_DEBUG=true to surface verbose decision logs.
+# Auto-imported by build.sh — no shim needed.
+#
+# ── LOAD_ENV_LOG=summary ────────────────────────────────────────────
+# By default every job logs every loaded config var. Set LOAD_ENV_LOG=
+# summary to shorten to a one-line count, or LOAD_ENV_LOG=false to
+# silence. Secrets are always redacted.
+
+---
+version: 2
+
+plan:
+  project-key: DEVOPS
+  key: CIT
+  name: Container Build Template
+  description: |-
+    Builds, scans, signs (dormant), and promotes (manual) a single
+    container image based on the upstream pinned in image.env.
+    Pipeline mirrors .gitlab-ci.yml stage-for-stage.
+
+# Polling interval (seconds) for the linked repository. Linked at plan
+# creation in the Bamboo UI — no `repositories:` block needed.
+triggers:
+  - polling: 60
+
+stages:
+  - Prescan:
+      jobs:
+        - Xray Vuln Prescan
+        - Xray SBOM Prescan
+        - Syft SBOM Prescan
+        # - Trivy Vuln Prescan   # DORMANT (Trivy banned for business
+        # - Trivy SBOM Prescan   # use). Uncomment BOTH entries here
+        #                        # AND the job blocks below.
+  - Build:
+      jobs:
+        - Build
+  - Postscan:
+      jobs:
+        - Syft SBOM Postscan
+        - Xray SBOM Postscan
+        - Xray Vuln Postscan
+        - Grype Vuln
+        - Grype DB Sync     # opt-in air-gap mirror (no-op without
+                            # ARTIFACTORY_GRYPE_DB_REPO)
+        # - Trivy Vuln Postscan
+        # - Trivy SBOM Postscan
+  # - Sign:           # COMMENTED OUT — no cosign infra yet. Restore
+  #     jobs:        # by uncommenting both this stage and the
+  #       - Cosign Sign  # Cosign Sign job block below.
+  - Ingest:
+      jobs:
+        - SBOM Ingest
+        - Vuln Ingest
+
+# ═══════════════════════════════════════════════════════════════════
+# BUILD
+# ═══════════════════════════════════════════════════════════════════
+Build:
+  tasks:
+    - checkout
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+
+            # ── Path gate ────────────────────────────────────────────
+            # Skip the full flow if no image-relevant file changed.
+            # Editing README, LICENSE, renovate.json, .gitignore etc.
+            # writes SKIP=true to build.env and exits cleanly — every
+            # downstream job checks SKIP and no-ops. FORCE_ALL=true
+            # bypasses.
+            if [ "${bamboo_FORCE_ALL:-false}" != "true" ]; then
+              CHANGED=$(git diff --name-only HEAD~1 HEAD \
+                -- image.env image.env.example Dockerfile.example inject-certs.sh install-ca-certificates.sh scripts/ certs/ bamboo-specs/bamboo.yaml 2>/dev/null \
+                || git diff --name-only HEAD \
+                -- image.env image.env.example Dockerfile.example inject-certs.sh install-ca-certificates.sh scripts/ certs/ bamboo-specs/bamboo.yaml)
+              if [ -z "$CHANGED" ]; then
+                echo "No image-relevant changes — skipping"
+                echo "SKIP=true" > build.env
+                exit 0
+              fi
+              echo "Changed files:"
+              echo "$CHANGED" | sed 's/^/  /'
+            fi
+
+            # ── Renamed-global shim (svc_* → script-expected names) ──
+            # build.sh auto-imports every bamboo_* as the bare name.
+            # The exports below cover ONLY the cases where the shared
+            # global has a different name (svc_*) than build.sh expects.
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export HARBOR_USER="${bamboo_svc_harbor_user:-${bamboo_HARBOR_USER:-}}"
+            export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
+
+            # Source image.env so CRANE_URL + ARTIFACTORY_USER are
+            # available for the crane install + docker-config write.
+            set -a; . ./image.env; set +a
+
+            # crane install — needed for base.digest resolution. Auth
+            # added when ARTIFACTORY_* set (internal mirror).
+            if ! command -v crane >/dev/null 2>&1; then
+              CRANE_URL_EFFECTIVE="${CRANE_URL:-${bamboo_CRANE_URL:-https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz}}"
+              mkdir -p "${HOME}/.local/bin"
+              if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ]; then
+                curl -fsL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" "${CRANE_URL_EFFECTIVE}" | tar xz -C "${HOME}/.local/bin/" crane
+              else
+                curl -fsL "${CRANE_URL_EFFECTIVE}" | tar xz -C "${HOME}/.local/bin/" crane
+              fi
+              export PATH="${HOME}/.local/bin:${PATH}"
+            fi
+
+            # Write ~/.docker/config.json so docker / syft / crane can
+            # authenticate to UPSTREAM_REGISTRY (internal mirrors).
+            # Safe no-op when ARTIFACTORY_* / UPSTREAM_REGISTRY unset.
+            if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ] && [ -n "${UPSTREAM_REGISTRY:-}" ]; then
+              _host="${UPSTREAM_REGISTRY%%/*}"
+              AUTH=$(printf '%s:%s' "${ARTIFACTORY_USER}" "${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')
+              mkdir -p "${HOME}/.docker"
+              printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${_host}" "${AUTH}" > "${HOME}/.docker/config.json"
+              chmod 600 "${HOME}/.docker/config.json"
+              echo "→ wrote ~/.docker/config.json for ${_host}"
+            fi
+
+            # Branch-aware push: main/master pushes; feature branches
+            # validate (build + scan) without pushing. build.sh handles
+            # its own docker login + jf install — don't do those here.
+            if [ "$bamboo_planRepository_branchName" = "main" ] || [ "$bamboo_planRepository_branchName" = "master" ]; then
+              bash ./scripts/build.sh --push --dockerfile Dockerfile.example --project-root "$(pwd)"
+            else
+              bash ./scripts/build.sh --dockerfile Dockerfile.example --project-root "$(pwd)"
+            fi
+  artifacts:
+    - name: build-env
+      location: .
+      pattern: build.env
+      shared: true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Syft SBOM of the BUILT image
+# ═══════════════════════════════════════════════════════════════════
+Syft SBOM Postscan:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            # set -a auto-exports build.env's plain KEY=VALUE lines
+            # into spawned subshells. No `export ` prefix in build.env
+            # (GitLab's dotenv parser rejects it).
+            set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            # Relay svc_* renamed globals.
+            export HARBOR_USER="${bamboo_svc_harbor_user:-${bamboo_HARBOR_USER:-}}"
+            export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
+
+            # SBOM_FILE comes from build.env (canonical from
+            # scripts/lib/artifact-names.sh).
+            bash ./scripts/scan/syft-sbom.sh
+  artifacts:
+    - name: sbom
+      location: .
+      pattern: 'sbom.cdx.json'
+      shared: true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# PRESCAN — Syft SBOM of UPSTREAM_REF (before build runs)
+# ═══════════════════════════════════════════════════════════════════
+Syft SBOM Prescan:
+  tasks:
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            . ./image.env
+            export SBOM_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+            bash ./scripts/scan/syft-sbom.sh
+  artifacts:
+    - name: sbom-prescan
+      location: .
+      pattern: 'sbom.cdx.json'
+      shared: true
+      required: false
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Grype vulnerability scan (consumes Syft SBOM)
+# ═══════════════════════════════════════════════════════════════════
+Grype Vuln:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+          - name: sbom
+            destination: .
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            # Optional Grype DB mirror auth — needed only when
+            # ARTIFACTORY_GRYPE_DB_REPO is set in image.env.
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+
+            # Set GRYPE_FAIL_ON_SEVERITY="Critical" (or "Critical,High")
+            # in image.env / plan vars to make this a hard gate.
+            bash ./scripts/scan/grype-vuln.sh
+  artifacts:
+    - name: vuln-scan-grype
+      location: .
+      pattern: vuln-scan.json
+      shared: true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Grype DB mirror (opt-in air-gap support)
+# ═══════════════════════════════════════════════════════════════════
+# Self-gating: exits 0 when ARTIFACTORY_GRYPE_DB_REPO is unset.
+# Mirrors GitLab's grype-db-sync.
+Grype DB Sync:
+  tasks:
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+
+            # `|| true` mirrors GitLab's optional-job semantics. Drop
+            # the suffix to fail loudly on missing mirror config.
+            bash ./scripts/sync/mirror-grype-db.sh || true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# Xray scans — paired vuln + SBOM, split across Prescan / Postscan
+# ═══════════════════════════════════════════════════════════════════
+# Four jobs, each single-responsibility, parallel within its stage:
+#   Xray Vuln Prescan  → scan UPSTREAM_REF → vuln-scan.json
+#   Xray SBOM Prescan  → scan UPSTREAM_REF → sbom.cdx.json
+#   Xray Vuln Postscan → scan IMAGE_DIGEST → vuln-scan.json
+#   Xray SBOM Postscan → scan IMAGE_DIGEST → sbom.cdx.json
+#
+# All four source scripts/lib/load-image-env.sh which auto-imports
+# every bamboo_* → bare name. The shim blocks only re-export svc_*
+# renamed service-account creds.
+#
+# Prescan jobs pass XRAY_SCAN_REF explicitly so the script's resolution
+# chain doesn't fall back to IMAGE_DIGEST (build hasn't run yet).
+# Set XRAY_FAIL_ON_SEVERITY in image.env / plan vars to enforce a gate.
+Xray Vuln Prescan:
+  tasks:
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+
+            . ./image.env
+            export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+            bash ./scripts/scan/xray-vuln.sh
+  artifacts:
+    - name: xray-scan-prescan
+      location: .
+      pattern: vuln-scan.json
+      shared: true
+      required: false
+  requirements:
+    - system.docker.executable
+
+Xray SBOM Prescan:
+  tasks:
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+
+            . ./image.env
+            export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+            bash ./scripts/scan/xray-sbom.sh
+  artifacts:
+    - name: xray-sbom-prescan
+      location: .
+      pattern: sbom.cdx.json
+      shared: true
+      required: false
+  requirements:
+    - system.docker.executable
+
+# Postscan — scan the BUILT image (IMAGE_DIGEST from build.env).
+# Includes any cert injection / Dockerfile FORK EDITS.
+Xray Vuln Postscan:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+
+            # IMAGE_DIGEST is in env from build.env — script auto-resolves.
+            bash ./scripts/scan/xray-vuln.sh
+  artifacts:
+    - name: xray-scan-postscan
+      location: .
+      pattern: vuln-scan.json
+      shared: true
+      required: false
+  requirements:
+    - system.docker.executable
+
+Xray SBOM Postscan:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+
+            bash ./scripts/scan/xray-sbom.sh
+  artifacts:
+    - name: xray-sbom-postscan
+      location: .
+      pattern: sbom.cdx.json
+      shared: true
+      required: false
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# PRE/POSTSCAN — Trivy vuln + SBOM (DORMANT: banned for business use)
+# ═══════════════════════════════════════════════════════════════════
+# Re-enable by uncommenting any/all 4 blocks below AND the matching
+# entries in the Prescan / Postscan stage lists at the top. Scripts
+# pin Trivy to v0.69.3 (last safe pre-compromise binary) and refuse
+# v0.69.4–v0.69.6.
+#
+# Trivy Vuln Prescan:
+#   tasks:
+#     - script:
+#         interpreter: SHELL
+#         scripts:
+#           - |-
+#             . ./image.env
+#             export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#             bash ./scripts/scan/trivy-vuln.sh
+#   artifacts:
+#     - name: vuln-scan-trivy-prescan
+#       location: .
+#       pattern: vuln-scan.json
+#       shared: true
+#       required: false
+#   requirements:
+#     - system.docker.executable
+#
+# Trivy SBOM Prescan:
+#   tasks:
+#     - script:
+#         interpreter: SHELL
+#         scripts:
+#           - |-
+#             . ./image.env
+#             export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#             bash ./scripts/scan/trivy-sbom.sh
+#   artifacts:
+#     - name: sbom-trivy-prescan
+#       location: .
+#       pattern: sbom.cdx.json
+#       shared: true
+#       required: false
+#   requirements:
+#     - system.docker.executable
+#
+# Trivy Vuln Postscan:
+#   tasks:
+#     - artifact-download:
+#         artifacts:
+#           - name: build-env
+#             destination: .
+#     - script:
+#         interpreter: SHELL
+#         scripts:
+#           - |-
+#             set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+#             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+#             bash ./scripts/scan/trivy-vuln.sh
+#   artifacts:
+#     - name: vuln-scan-trivy-postscan
+#       location: .
+#       pattern: vuln-scan.json
+#       shared: true
+#   requirements:
+#     - system.docker.executable
+#
+# Trivy SBOM Postscan:
+#   tasks:
+#     - artifact-download:
+#         artifacts:
+#           - name: build-env
+#             destination: .
+#     - script:
+#         interpreter: SHELL
+#         scripts:
+#           - |-
+#             set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+#             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+#             bash ./scripts/scan/trivy-sbom.sh
+#   artifacts:
+#     - name: sbom-trivy-postscan
+#       location: .
+#       pattern: sbom.cdx.json
+#       shared: true
+#   requirements:
+#     - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# SIGN — cosign sign + SBOM/Grype attestations  (DORMANT)
+# ═══════════════════════════════════════════════════════════════════
+# Restore by uncommenting the Cosign Sign block AND the `- Sign:`
+# entry in the stages list. Configure COSIGN_KEY as a Bamboo plan var
+# (file: type) pointing at Vault transit / KMS rather than raw key.
+#
+# Cosign Sign:
+#   tasks:
+#     - artifact-download:
+#         artifacts:
+#           - name: build-env
+#             destination: .
+#           - name: sbom
+#             destination: .
+#           - name: vuln-scan-grype
+#             destination: .
+#     - script:
+#         interpreter: SHELL
+#         scripts:
+#           - |-
+#             set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+#             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+#
+#             export HARBOR_USER="${bamboo_svc_harbor_user:-${bamboo_HARBOR_USER:-}}"
+#             export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
+#
+#             if [ -z "${bamboo_COSIGN_KEY:-}" ]; then
+#               echo "SKIPPED: COSIGN_KEY plan var not set"
+#               exit 0
+#             fi
+#             export COSIGN_KEY="${bamboo_COSIGN_KEY}"
+#
+#             if ! command -v cosign >/dev/null 2>&1; then
+#               COSIGN_URL_EFFECTIVE="${bamboo_COSIGN_URL:-https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64}"
+#               mkdir -p "${HOME}/.local/bin"
+#               curl -sL "${COSIGN_URL_EFFECTIVE}" -o "${HOME}/.local/bin/cosign"
+#               chmod +x "${HOME}/.local/bin/cosign"
+#               export PATH="${HOME}/.local/bin:${PATH}"
+#             fi
+#
+#             if [ -n "${HARBOR_USER:-}" ] && [ -n "${bamboo_HARBOR_REGISTRY:-}" ]; then
+#               echo "${HARBOR_PASSWORD}" | docker login "${bamboo_HARBOR_REGISTRY}" \
+#                 -u "${HARBOR_USER}" --password-stdin
+#             fi
+#
+#             TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
+#             cosign sign --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#               -a "ci.build=${bamboo_buildResultKey}" \
+#               -a "ci.plan=${bamboo_planKey}" \
+#               -a "git.commit=${GIT_SHA}" \
+#               "${TARGET}"
+#             [ -f "${SBOM_FILE}" ] && cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#               --type cyclonedx --predicate "${SBOM_FILE}" "${TARGET}"
+#             [ -f "${VULN_SCAN_FILE}" ] && cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#               --type vuln --predicate "${VULN_SCAN_FILE}" "${TARGET}"
+#   requirements:
+#     - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# INGEST — post SBOM + vuln scan to configured sinks
+# ═══════════════════════════════════════════════════════════════════
+# Two parallel ingest jobs, same pattern. No-op when no sink env
+# vars set. `|| true` mirrors GitLab's allow_failure: true — sinks
+# are best-effort.
+SBOM Ingest:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+          - name: sbom
+            destination: .
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export DEPENDENCY_TRACK_API_KEY="${bamboo_svc_dependency_track_api_key:-${bamboo_DEPENDENCY_TRACK_API_KEY:-}}"
+            export SBOM_WEBHOOK_AUTH_HEADER="${bamboo_svc_sbom_webhook_auth_header:-${bamboo_SBOM_WEBHOOK_AUTH_HEADER:-}}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+
+            bash ./scripts/ingest/sbom-post.sh "${SBOM_FILE}" || true
+  requirements:
+    - system.docker.executable
+
+Vuln Ingest:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+          - name: vuln-scan-grype
+            destination: .
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export VULN_WEBHOOK_AUTH_HEADER="${bamboo_svc_vuln_webhook_auth_header:-${bamboo_VULN_WEBHOOK_AUTH_HEADER:-}}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+
+            bash ./scripts/ingest/vuln-post.sh "${VULN_SCAN_FILE}" || true
+  requirements:
+    - system.docker.executable

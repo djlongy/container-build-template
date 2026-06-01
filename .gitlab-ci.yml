@@ -1,0 +1,643 @@
+# ─── PIPELINE CONFIG ───────────────────────────────────────────────
+# Vendored from container-build-template. Edit only when adding /
+# removing pipeline jobs. Behavioural knobs (registry, scan severity,
+# SBOM sinks, etc.) live in image.env — not here.
+# ───────────────────────────────────────────────────────────────────
+#
+# Single-image build + DevSecOps pipeline. Everything inline — no
+# includes, no template indirection. A newcomer can read this one
+# file and see the entire flow.
+#
+# Pipeline shape (5 stages; sign commented out, promote dropped):
+#   prescan   → scan UPSTREAM_REF before build. 3 SBOM + 2 vuln
+#               producers run in parallel; downstream picks up via
+#               canonical SBOM_FILE / VULN_SCAN_FILE.
+#                 xray-vuln-prescan, xray-sbom-prescan, syft-sbom-prescan
+#                 (dormant: trivy-vuln-prescan, trivy-sbom-prescan)
+#   build     → docker build + push via REGISTRY_KIND dispatch
+#               (scripts/push-backends/<harbor|artifactory>.sh).
+#               Emits build.env with SBOM_FILE / VULN_SCAN_FILE.
+#   postscan  → scan the BUILT image (IMAGE_DIGEST from build.env).
+#                 syft-sbom-postscan, xray-sbom-postscan,
+#                 xray-vuln-postscan, grype-vuln, grype-db-sync
+#                 (dormant: trivy-vuln-postscan, trivy-sbom-postscan)
+#   sign      → cosign-sign (dormant — commented)
+#   ingest    → sbom-ingest (ships sbom.cdx.json to configured sinks)
+#
+# Variable precedence: shell / CI vars > image.env. Only SECRETS need
+# to be masked CI variables (see README "Required CI variables —
+# secrets only"). Everything else lives in image.env.
+#
+# Production promotion is INTENTIONALLY not in this pipeline — manual
+# ritual via Artifactory's native copy UI. See README "Promoting to
+# production".
+
+stages:
+  - prescan      # Xray scan + SBOM of UPSTREAM_REF
+  - build
+  - postscan     # Xray scan + SBOM of the BUILT image, Syft SBOM, Grype
+  - sign         # COMMENTED OUT — no cosign infra yet
+  - ingest       # sbom-ingest + vuln-ingest → configured sinks
+
+# ── Path gate ──────────────────────────────────────────────────────
+# Pipeline only runs when something image-relevant changed. Editing
+# README, LICENSE, renovate.json, bamboo-specs/, .gitignore won't
+# trigger a build. Tag pushes and FORCE_ALL=true bypass the gate.
+.build-changes: &build-changes
+  - image.env
+  - image.env.example
+  - Dockerfile.example
+  - scripts/**/*
+  - certs/**/*
+  - .gitlab-ci.yml
+
+.build-rules: &build-rules
+  - if: '$FORCE_ALL == "true"'
+  - if: '$CI_COMMIT_TAG'
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    changes: *build-changes
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    changes: *build-changes
+
+# Pipeline-level gate — without this, GitLab still creates an empty
+# (red) "container" pipeline when all jobs are filtered out by path
+# rules. Match build-rules so pushes that touch no watched file
+# produce no pipeline at all.
+workflow:
+  rules:
+    - if: '$FORCE_ALL == "true"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: *build-changes
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *build-changes
+
+variables:
+  # docker:dind TLS disabled — matches internal runners that don't
+  # mount /certs/client between dind service and job container.
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_BUILDKIT: "1"
+
+  # ── Canonical artifact filenames ────────────────────────────────
+  # Mirror scripts/lib/artifact-names.sh defaults. CI YAML can't
+  # `source` shell files so they're duplicated here. If you ever
+  # rename them, update both places.
+  SBOM_FILE: "sbom.cdx.json"
+  VULN_SCAN_FILE: "vuln-scan.json"
+
+  # ── Air-gap configuration ───────────────────────────────────────
+  # Every runtime download is overridable via group/project CI vars.
+  # Defaults point at public sources — override for internal mirrors.
+  DOCKER_CLI_IMAGE: "docker:27-cli"
+  DOCKER_DIND_IMAGE: "docker:27-dind"
+  ALPINE_IMAGE: "alpine:3.20"
+
+  CRANE_URL: "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz"
+  # Tool versions: empty = script's built-in default. Override per
+  # pipeline by setting as a project/group CI variable.
+  SYFT_INSTALLER_URL: "https://raw.githubusercontent.com/anchore/syft/main/install.sh"
+  SYFT_VERSION: ""
+  GRYPE_INSTALLER_URL: "https://raw.githubusercontent.com/anchore/grype/main/install.sh"
+  GRYPE_VERSION: ""
+  COSIGN_URL: "https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64"
+  # JFrog CLI — sudoless. Set ONE of the three to a file in your
+  # local Artifactory. Lands in ${JF_INSTALL_DIR:-$HOME/.local/bin}.
+  JF_BINARY_URL: ""
+  JF_DEB_URL: ""
+  JF_RPM_URL: ""
+  JF_INSTALL_DIR: ""
+
+  # Splunk HEC for Xray scan audit (xray-vuln.sh / sbom-post.sh).
+  # Both URL + TOKEN required to actually ship. Keep TOKEN masked.
+  SPLUNK_HEC_URL: ""
+  SPLUNK_HEC_INDEX: "main"
+  SPLUNK_HEC_SOURCETYPE: "jfrog:xray:scan"
+  SPLUNK_HEC_INSECURE: "false"
+
+  BUILD_DEBUG: "false"
+  # Grype DB air-gap. ARTIFACTORY_GRYPE_DB_REPO set = grype-db-sync
+  # mirrors the Anchore DB to that repo and grype-vuln pulls from it.
+  ARTIFACTORY_GRYPE_DB_REPO: ""
+  GRYPE_DB_MIRROR_SUBPATH: "grype-db/v6"
+
+# ── Shared before_script: install tools used by most jobs ──────────
+.install-tools: &install-tools
+  - |
+    # Skip apk-add when every tool is already on PATH. Set ALPINE_IMAGE
+    # to a pre-baked image (bash/git/curl/openssl/jq/python3/crane) to
+    # avoid any dl-cdn.alpinelinux.org fetch. python3 is needed by
+    # scripts/push-backends/artifactory.sh (build-info-merge.py).
+    if command -v bash >/dev/null 2>&1 \
+       && command -v git >/dev/null 2>&1 \
+       && command -v curl >/dev/null 2>&1 \
+       && command -v openssl >/dev/null 2>&1 \
+       && command -v jq >/dev/null 2>&1 \
+       && command -v python3 >/dev/null 2>&1; then
+      echo "→ tools already on PATH — skipping apk add (pre-baked image)"
+    else
+      apk add --no-cache bash git curl openssl jq python3
+    fi
+  - |
+    # crane — used by build.sh for base.digest. Sudoless install into
+    # $HOME/.local/bin. Auth added when ARTIFACTORY_USER + PASSWORD set
+    # (CRANE_URL pointing at an internal Artifactory mirror).
+    mkdir -p "${HOME}/.local/bin"
+    export PATH="${HOME}/.local/bin:${PATH}"
+    if ! command -v crane >/dev/null 2>&1; then
+      # -fsL: -f fails fast on HTTP errors (prevents HTML-error-body
+      # → tar: invalid magic), -s silent, -L follow redirects.
+      if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ]; then
+        curl -fsL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" "${CRANE_URL}" | tar xz -C "${HOME}/.local/bin/" crane
+      else
+        curl -fsL "${CRANE_URL}" | tar xz -C "${HOME}/.local/bin/" crane
+      fi
+    fi
+  - |
+    # Source image.env with shell-wins-over-file precedence so CI vars
+    # / pipeline-trigger vars override image.env values. GitLab's
+    # default shell is busybox /bin/sh, which can't run our bash-only
+    # load-image-env.sh — implement the same algorithm in pure POSIX.
+    #
+    # Algorithm: snapshot non-empty shell vars (base64-encoded for
+    # safe round-trip), source image.env, restore the snapshot.
+    if [ -f image.env ]; then
+      _IMG_KEYS=$(grep -oE '^[A-Z_][A-Z0-9_]*=' image.env | sed 's/=$//' | sort -u)
+      _IMG_SNAP=$(mktemp)
+      for k in $_IMG_KEYS; do
+        eval "_v=\"\${${k}:-}\""
+        if [ -n "${_v}" ]; then
+          # Use a tab between key and value — base64 output never
+          # contains tabs but DOES contain `=` padding.
+          printf '%s\t%s\n' "${k}" "$(printf '%s' "${_v}" | base64 | tr -d '\n')" >> "${_IMG_SNAP}"
+        fi
+      done
+      set -a; . ./image.env; set +a
+      while read -r _line; do
+        _rk="${_line%%	*}"   # literal TAB inside the braces
+        _rv="${_line#*	}"
+        _rdec=$(printf '%s' "${_rv}" | base64 -d)
+        eval "${_rk}=\"\${_rdec}\""
+        export "${_rk}"
+      done < "${_IMG_SNAP}"
+      rm -f "${_IMG_SNAP}"
+      unset _IMG_KEYS _IMG_SNAP _v _line _rk _rv _rdec
+    fi
+  - |
+    # Write ~/.docker/config.json so syft / crane / docker daemon can
+    # authenticate to UPSTREAM_REGISTRY without needing `docker login`
+    # (alpine scan jobs have no dind). Safe no-op when ARTIFACTORY_*
+    # creds or UPSTREAM_REGISTRY are unset.
+    if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ] && [ -n "${UPSTREAM_REGISTRY:-}" ]; then
+      _host="${UPSTREAM_REGISTRY%%/*}"
+      AUTH=$(printf '%s:%s' "${ARTIFACTORY_USER}" "${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')
+      mkdir -p "${HOME}/.docker"
+      printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${_host}" "${AUTH}" > "${HOME}/.docker/config.json"
+      chmod 600 "${HOME}/.docker/config.json"
+      echo "→ wrote ~/.docker/config.json for ${_host}"
+    fi
+
+# ═══════════════════════════════════════════════════════════════════
+# BUILD
+# ═══════════════════════════════════════════════════════════════════
+build:
+  stage: build
+  image: ${DOCKER_CLI_IMAGE}
+  services:
+    - name: ${DOCKER_DIND_IMAGE}
+      alias: docker
+  before_script:
+    - *install-tools
+  script:
+    # Branch-aware push: only default branch + tags push to registry.
+    # Feature/MR pipelines build + scan as validation without pushing
+    # so short-lived branches don't pollute the registry. build.sh's
+    # no-push path still emits build.env with IMAGE_REF=UPSTREAM_REF
+    # for downstream postscan jobs.
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ] || [ -n "$CI_COMMIT_TAG" ]; then
+        bash ./scripts/build.sh --push --dockerfile Dockerfile.example
+      else
+        bash ./scripts/build.sh --dockerfile Dockerfile.example
+      fi
+  artifacts:
+    # Downstream jobs both `. ./build.env` AND consume the dotenv-
+    # imported env vars. Expose as file + dotenv report so both work.
+    paths:
+      - build.env
+    reports:
+      dotenv: build.env
+    expire_in: 1 week
+  rules: *build-rules
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Syft SBOM of the BUILT image
+# ═══════════════════════════════════════════════════════════════════
+# Writes canonical sbom.cdx.json (filename from build.env's SBOM_FILE).
+# Swap to scripts/scan/xray-sbom.sh or trivy-sbom.sh and downstream
+# Grype + sbom-post stages keep working — they read the same SBOM_FILE.
+syft-sbom-postscan:
+  stage: postscan
+  image: ${ALPINE_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+  before_script:
+    - *install-tools
+  script:
+    # set -a auto-exports the plain KEY=VALUE lines into spawned
+    # `bash ./scripts/...` subshells. GitLab also dotenv-injects them
+    # via reports.dotenv — this is belt-and-braces.
+    - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+    - bash ./scripts/scan/syft-sbom.sh
+  artifacts:
+    paths:
+      - ${SBOM_FILE}
+    reports:
+      cyclonedx: ${SBOM_FILE}
+    expire_in: 1 month
+  rules: *build-rules
+
+# ═══════════════════════════════════════════════════════════════════
+# PRESCAN — Syft SBOM of UPSTREAM_REF (before build runs)
+# ═══════════════════════════════════════════════════════════════════
+# Same script, different target — early visibility on the upstream's
+# component graph without waiting for the build.
+syft-sbom-prescan:
+  stage: prescan
+  image: ${ALPINE_IMAGE}
+  needs: []
+  before_script:
+    - *install-tools
+  script:
+    - |
+      export SBOM_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+      bash ./scripts/scan/syft-sbom.sh
+  artifacts:
+    paths:
+      - sbom.cdx.json
+    expire_in: 1 month
+    when: always
+  rules: *build-rules
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Grype DB mirror (optional, air-gap)
+# ═══════════════════════════════════════════════════════════════════
+# Mirrors the Anchore Grype CVE DB to an Artifactory generic repo so
+# the grype job fetches without reaching grype.anchore.io. Only runs
+# when ARTIFACTORY_GRYPE_DB_REPO is set — otherwise grype downloads
+# directly from Anchore's public CDN.
+grype-db-sync:
+  stage: postscan
+  image: ${ALPINE_IMAGE}
+  needs: []
+  rules:
+    - if: '$ARTIFACTORY_GRYPE_DB_REPO != "" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$ARTIFACTORY_GRYPE_DB_REPO != "" && $CI_PIPELINE_SOURCE == "schedule"'
+    - when: never
+  before_script:
+    - *install-tools
+  script:
+    - ./scripts/sync/mirror-grype-db.sh
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Grype vulnerability scan (consumes Syft SBOM)
+# ═══════════════════════════════════════════════════════════════════
+# Grype reads the CycloneDX SBOM (no image re-pull) and matches
+# components against its vulnerability DB. Set GRYPE_FAIL_ON_SEVERITY
+# in image.env / CI var to make this a hard gate.
+grype-vuln:
+  stage: postscan
+  image: ${ALPINE_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+    - job: syft-sbom-postscan
+      artifacts: true
+    - job: grype-db-sync
+      optional: true
+  before_script:
+    - *install-tools
+  script:
+    - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+    - bash ./scripts/scan/grype-vuln.sh
+  artifacts:
+    paths:
+      - ${VULN_SCAN_FILE}
+    expire_in: 1 month
+  rules: *build-rules
+
+# ═══════════════════════════════════════════════════════════════════
+# PRESCAN — Xray on UPSTREAM_REF, gated, BEFORE build runs
+# ═══════════════════════════════════════════════════════════════════
+# Two jobs that scan the upstream image we're about to rebuild. They
+# run in prescan so a critical CVE in the upstream fails the pipeline
+# BEFORE build wastes runner time. Set XRAY_FAIL_ON_SEVERITY in
+# image.env to enforce a real gate; leave unset for audit-only.
+#
+# Both pass UPSTREAM_REF explicitly via XRAY_SCAN_REF so the script's
+# resolution chain doesn't fall back to IMAGE_DIGEST (build hasn't run).
+.xray-anchor: &xray-anchor
+  image: ${DOCKER_CLI_IMAGE}
+  services:
+    - name: ${DOCKER_DIND_IMAGE}
+      alias: docker
+  variables:
+    # Move jf's home dir INTO the project so GitLab cache can persist
+    # the Xray Analyzer Manager (~300MB) across job runs. Without
+    # this, each xray job re-downloads it and 4 jobs × 300MB fills
+    # the runner disk.
+    JFROG_CLI_HOME_DIR: "${CI_PROJECT_DIR}/.jfrog-cli-home"
+  cache:
+    # Static key shared across branches so the first xray job's
+    # analyzer download is reused by every subsequent job. Bump the
+    # suffix when you upgrade JF_BINARY_URL (jf CLI version) to
+    # invalidate.
+    key: jfrog-deps-cache-v1
+    paths:
+      - .jfrog-cli-home/dependencies/
+    policy: pull-push
+  before_script:
+    - *install-tools
+  rules: *build-rules
+  # Concurrency note: if your Xray instance is a shared trial /
+  # under-provisioned, add `resource_group: xray-scan` to serialise
+  # every xray-* job. On properly-provisioned Pro / self-hosted Xray,
+  # concurrent scans cut pipeline wall time by ~50%.
+  # Policy-gate note: when XRAY_FAIL_ON_SEVERITY is set, the script
+  # exits 2 on violation. To make THAT a real gate, set allow_failure:
+  # false on xray-vuln-prescan only. Postscan jobs stay allow_failure:
+  # true (audit shipping is non-blocking).
+  allow_failure: true
+
+xray-vuln-prescan:
+  <<: *xray-anchor
+  stage: prescan
+  needs: []      # no build artifacts — scans UPSTREAM_REF
+  script:
+    - |
+      export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+      bash ./scripts/scan/xray-vuln.sh
+  artifacts:
+    paths:
+      - ${VULN_SCAN_FILE}
+    expire_in: 1 month
+    when: always
+
+xray-sbom-prescan:
+  <<: *xray-anchor
+  stage: prescan
+  needs: []
+  script:
+    - |
+      export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+      bash ./scripts/scan/xray-sbom.sh
+  artifacts:
+    paths:
+      - ${SBOM_FILE}
+    expire_in: 1 month
+    when: always
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Xray on the BUILT image (IMAGE_DIGEST)
+# ═══════════════════════════════════════════════════════════════════
+# Runs AFTER build. Scans what consumers will actually pull, including
+# cert injection + Dockerfile FORK EDITS. Scripts default to scanning
+# IMAGE_DIGEST (from build.env via dotenv), so no XRAY_SCAN_REF needed.
+xray-vuln-postscan:
+  <<: *xray-anchor
+  stage: postscan
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - bash ./scripts/scan/xray-vuln.sh
+  artifacts:
+    paths:
+      - ${VULN_SCAN_FILE}
+    expire_in: 1 month
+    when: always
+
+xray-sbom-postscan:
+  <<: *xray-anchor
+  stage: postscan
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - bash ./scripts/scan/xray-sbom.sh
+  artifacts:
+    paths:
+      - ${SBOM_FILE}
+    expire_in: 1 month
+    when: always
+
+# ═══════════════════════════════════════════════════════════════════
+# PRE/POSTSCAN — Trivy vuln + SBOM (DORMANT: banned for business use)
+# ═══════════════════════════════════════════════════════════════════
+# Uncomment any/all 4 jobs to re-enable Trivy. Scripts pin v0.69.3
+# (last safe pre-compromise binary) and refuse v0.69.4–v0.69.6 even
+# if the installer mirror serves them.
+#
+# Each job emits canonical artifacts (vuln-scan.json / sbom.cdx.json),
+# so swapping Trivy for Xray or Grype is a one-line script-name
+# change. Xray + Grype already cover the same ground in the meantime.
+#
+# trivy-vuln-prescan:
+#   stage: prescan
+#   image: ${ALPINE_IMAGE}
+#   needs: []
+#   before_script:
+#     - *install-tools
+#   script:
+#     - |
+#       export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#       bash ./scripts/scan/trivy-vuln.sh
+#   artifacts:
+#     paths:
+#       - vuln-scan.json
+#     expire_in: 1 month
+#     when: always
+#   rules: *build-rules
+#
+# trivy-sbom-prescan:
+#   stage: prescan
+#   image: ${ALPINE_IMAGE}
+#   needs: []
+#   before_script:
+#     - *install-tools
+#   script:
+#     - |
+#       export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#       bash ./scripts/scan/trivy-sbom.sh
+#   artifacts:
+#     paths:
+#       - sbom.cdx.json
+#     expire_in: 1 month
+#     when: always
+#   rules: *build-rules
+#
+# trivy-vuln-postscan:
+#   stage: postscan
+#   image: ${ALPINE_IMAGE}
+#   needs:
+#     - job: build
+#       artifacts: true
+#   before_script:
+#     - *install-tools
+#   script:
+#     - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+#     - bash ./scripts/scan/trivy-vuln.sh
+#   artifacts:
+#     paths:
+#       - ${VULN_SCAN_FILE}
+#     expire_in: 1 month
+#   rules: *build-rules
+#
+# trivy-sbom-postscan:
+#   stage: postscan
+#   image: ${ALPINE_IMAGE}
+#   needs:
+#     - job: build
+#       artifacts: true
+#   before_script:
+#     - *install-tools
+#   script:
+#     - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+#     - bash ./scripts/scan/trivy-sbom.sh
+#   artifacts:
+#     paths:
+#       - ${SBOM_FILE}
+#     reports:
+#       cyclonedx: ${SBOM_FILE}
+#     expire_in: 1 month
+#   rules: *build-rules
+
+# ═══════════════════════════════════════════════════════════════════
+# SIGN — cosign sign + SBOM attestation  (DORMANT — no cosign infra yet)
+# ═══════════════════════════════════════════════════════════════════
+# Restore by uncommenting the block below AND configuring COSIGN_KEY
+# as a file-type CI variable (Vault transit / KMS preferred over a
+# raw private key). Signs the image by digest and attests the
+# CycloneDX SBOM + vuln scan as predicates.
+#
+# cosign-sign:
+#   stage: sign
+#   image: ${ALPINE_IMAGE}
+#   needs:
+#     - job: build
+#       artifacts: true
+#     - job: syft-sbom-postscan
+#       artifacts: true
+#     - job: grype-vuln
+#       artifacts: true
+#   before_script:
+#     - *install-tools
+#     - |
+#       mkdir -p "${HOME}/.local/bin"
+#       export PATH="${HOME}/.local/bin:${PATH}"
+#       if ! command -v cosign >/dev/null 2>&1; then
+#         curl -sL "${COSIGN_URL}" -o "${HOME}/.local/bin/cosign"
+#         chmod +x "${HOME}/.local/bin/cosign"
+#       fi
+#       cosign version
+#   script:
+#     - |
+#       if [ -z "${COSIGN_KEY:-}" ]; then
+#         echo "SKIPPED: COSIGN_KEY not set — image will be unsigned"
+#         exit 0
+#       fi
+#     - |
+#       # Write ~/.docker/config.json covering Harbor + (optionally)
+#       # Artifactory so cosign / syft can pull regardless of backend.
+#       mkdir -p ~/.docker
+#       AUTHS=""
+#       if [ -n "${HARBOR_USER:-}" ] && [ -n "${HARBOR_PASSWORD:-}" ]; then
+#         A=$(printf '%s' "${HARBOR_USER}:${HARBOR_PASSWORD}" | base64 -w0)
+#         AUTHS="${AUTHS}\"${HARBOR_REGISTRY}\":{\"auth\":\"${A}\"},"
+#       fi
+#       if [ "${REGISTRY_KIND:-}" = "artifactory" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
+#         ART_SECRET="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+#         ART_HOST="${ARTIFACTORY_PUSH_HOST:-}"
+#         if [ -z "${ART_HOST}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
+#           ART_HOST="${ARTIFACTORY_URL#https://}"
+#           ART_HOST="${ART_HOST#http://}"
+#           ART_HOST="${ART_HOST%%/*}"
+#         fi
+#         if [ -n "${ART_HOST}" ] && [ -n "${ART_SECRET}" ]; then
+#           A=$(printf '%s' "${ARTIFACTORY_USER}:${ART_SECRET}" | base64 -w0)
+#           AUTHS="${AUTHS}\"${ART_HOST}\":{\"auth\":\"${A}\"},"
+#         fi
+#       fi
+#       AUTHS="${AUTHS%,}"
+#       printf '{"auths":{%s}}\n' "${AUTHS}" > ~/.docker/config.json
+#     - |
+#       TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
+#       cosign sign --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#         -a "ci.build=${CI_JOB_ID}" \
+#         -a "ci.pipeline=${CI_PIPELINE_ID}" \
+#         -a "git.commit=${CI_COMMIT_SHA}" \
+#         "${TARGET}"
+#       [ -f "${SBOM_FILE}" ] && cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#         --type cyclonedx --predicate "${SBOM_FILE}" "${TARGET}"
+#       [ -f "${VULN_SCAN_FILE}" ] && cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#         --type vuln --predicate "${VULN_SCAN_FILE}" "${TARGET}"
+#   rules:
+#     - if: '$FORCE_ALL == "true"'
+#     - if: '$CI_COMMIT_TAG'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#       changes: *build-changes
+
+# ═══════════════════════════════════════════════════════════════════
+# INGEST — post SBOM + vuln scan to configured sinks
+# ═══════════════════════════════════════════════════════════════════
+# Two parallel ingest jobs, one per artifact type. Both are no-ops
+# when no sink env vars are set. Same producer-vs-consumer split as
+# the scan stages.
+#
+# sbom-ingest  → scripts/ingest/sbom-post.sh — webhook / Dependency-
+#                Track / Artifactory SBOM repo + archive / Splunk HEC.
+#                Default consumer is syft-sbom-postscan; swap to
+#                xray-sbom-postscan or trivy-sbom-postscan for a
+#                different producer (all write the same SBOM_FILE).
+#
+# vuln-ingest  → scripts/ingest/vuln-post.sh — webhook / Artifactory
+#                generic archive / Splunk HEC. Scanner-agnostic:
+#                auto-detects whether the report came from grype /
+#                trivy / xray (by report shape) and picks a sensible
+#                Splunk sourcetype.
+sbom-ingest:
+  stage: ingest
+  image: ${ALPINE_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+    - job: syft-sbom-postscan
+      artifacts: true
+  before_script:
+    - *install-tools
+  script:
+    - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+    - bash ./scripts/ingest/sbom-post.sh "${SBOM_FILE}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: true
+
+vuln-ingest:
+  stage: ingest
+  image: ${ALPINE_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+    - job: grype-vuln
+      artifacts: true
+  before_script:
+    - *install-tools
+  script:
+    - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+    - bash ./scripts/ingest/vuln-post.sh "${VULN_SCAN_FILE}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: true

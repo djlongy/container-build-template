@@ -1,0 +1,109 @@
+# ─── TEMPLATE — copy to Dockerfile ─────────────────────────────────
+# First-time setup:  cp Dockerfile.example Dockerfile
+# Edit ONLY the marked "FORK EDITS GO HERE" region in your copy. The
+# base / cert sidecar / USER restore are template logic — leave them.
+# Dynamic OCI labels (version, revision, created, base.digest, source)
+# are added by scripts/build.sh via `docker build --label`, not here.
+# ───────────────────────────────────────────────────────────────────
+#
+# Build shape:
+#   upstream base → cert sidecar (shell-bearing builder, so it works
+#   on distroless / chainguard / scratch too) → final stage re-bases
+#   FROM base → editable region → restore upstream USER.
+
+# ── Global ARGs ──────────────────────────────────────────────────────
+# build.sh passes these via --build-arg from image.env. The defaults
+# below only apply if someone runs `docker build .` directly without
+# the script.
+ARG UPSTREAM_REGISTRY=docker.io/library
+ARG UPSTREAM_IMAGE=nginx
+ARG UPSTREAM_TAG=1.29.8-alpine
+ARG ORIGINAL_USER=root
+ARG CERT_BUILDER_IMAGE=docker.io/library/alpine:3.20
+
+# ── Upstream base ────────────────────────────────────────────────────
+FROM ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG} AS base
+
+# ── Cert sidecar (shell-bearing builder) ─────────────────────────────
+# Runs in a SEPARATE image so cert prep works regardless of whether
+# the upstream base has a shell (chainguard FIPS, distroless static,
+# scratch). Produces an updated trust store = alpine system roots +
+# the corp CAs in certs/. The final stage COPYs the files over.
+#
+# Trade-off: this REPLACES the upstream's /etc/ssl/certs/ca-
+# certificates.crt + /etc/ssl/cert.pem with alpine's bundle. For
+# most images this is fine — alpine's bundle is a superset of Mozilla
+# CA list. For FIPS-only trust policies, fork this Dockerfile.
+#
+# Empty certs/ = sidecar runs but is a no-op (just alpine's defaults).
+FROM ${CERT_BUILDER_IMAGE} AS certs-source
+USER root
+
+# Two vendored shell scripts (next to this Dockerfile in every per-
+# image repo). Extracted from inline RUN so SonarQube / shellcheck
+# can scan the bash. Anyone who runs `docker build .` directly gets
+# a working build because every COPY source is in `ls`.
+#   install-ca-certificates.sh  best-effort install of ca-certificates
+#                               (skipped if rebuild tool already present)
+#   inject-certs.sh             cat-append corp CA into the trust bundle
+COPY install-ca-certificates.sh /tmp/install-ca-certificates.sh
+COPY inject-certs.sh            /tmp/inject-certs.sh
+COPY certs/                     /tmp/certs/
+
+RUN /tmp/install-ca-certificates.sh \
+ && /tmp/inject-certs.sh \
+ && rm -f /tmp/install-ca-certificates.sh /tmp/inject-certs.sh
+
+# ── Final image ──────────────────────────────────────────────────────
+# Re-bases FROM base so USER stays whatever upstream had. COPY --from
+# pulls the prepared trust files out of the builder. Pure file ops —
+# no RUN below this point until the editable region, so this works
+# for shell-less bases.
+FROM base AS final
+COPY --from=certs-source /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=certs-source /etc/ssl/cert.pem                  /etc/ssl/cert.pem
+COPY --from=certs-source /usr/local/share/ca-certificates   /usr/local/share/ca-certificates
+COPY --from=certs-source /etc/pki/ca-trust/source/anchors   /etc/pki/ca-trust/source/anchors
+
+# ═══════════════════════════════════════════════════════════════════
+# ▼▼▼  FORK EDITS GO HERE  ▼▼▼
+# ═══════════════════════════════════════════════════════════════════
+# Bespoke per-image work: package upgrades, extra installs, config
+# drops, HEALTHCHECK, ENV.
+#
+# Shell-less bases (chainguard FIPS, distroless static, scratch) can't
+# RUN anything — leave this region EMPTY for those. Cert COPYs above
+# are pure file ops and still work.
+#
+# When you DO add a RUN, prepend `USER root` (apk/apt need write
+# perms). The `USER ${ORIGINAL_USER}` directive at the bottom restores
+# the upstream's user automatically.
+#
+# Common patterns (uncomment what you need):
+#
+#   USER root
+#   # CVE remediation — pick the line that matches your upstream distro
+#   RUN apk update && apk upgrade --no-cache
+#   # RUN apt-get update && apt-get -y --only-upgrade upgrade && rm -rf /var/lib/apt/lists/*
+#   # RUN microdnf -y update && microdnf clean all
+#
+#   # Extra packages
+#   # RUN apk add --no-cache curl jq
+#
+#   # Static config
+#   # COPY config/nginx.conf /etc/nginx/nginx.conf
+#
+#   # Health check
+#   # HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost/ || exit 1
+#
+# Keep edits minimal. If your image needs hundreds of lines of bespoke
+# logic, fork the template and own it.
+# ═══════════════════════════════════════════════════════════════════
+# ▲▲▲  END FORK EDITS  ▲▲▲
+# ═══════════════════════════════════════════════════════════════════
+
+# Restore the upstream USER. build.sh auto-detects via `crane config`
+# and passes as a build-arg, so this is normally automatic. The
+# default "root" only applies for direct `docker build` (no script).
+ARG ORIGINAL_USER
+USER ${ORIGINAL_USER}

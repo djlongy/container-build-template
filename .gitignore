@@ -1,0 +1,65 @@
+# Build artifacts
+build.env
+*.log
+
+# image.env — LOCAL TESTING ONLY in the template repo, NOT committed.
+# Each per-image consumer repo (prometheus, redis, …) commits its own
+# image.env; the template's own image.env exists only for `./scripts/
+# build.sh` runs from a developer's clone. First-time setup:
+#   cp image.env.example image.env  &&  $EDITOR image.env
+# Secrets (tokens, passwords) MUST stay out of image.env — pass those
+# via CI variables instead.
+image.env
+
+# CA certificates and key material — injected at build time, never committed
+certs/*.crt
+certs/*.pem
+certs/*.srl
+certs/*.key
+certs/*.csr
+!certs/.gitkeep
+
+# Vault / credentials — never committed
+.vault-token
+credentials*.env
+
+# Agent / editor runtime state
+.claude/
+.playwright-mcp/
+
+# SonarQube scanner output
+.scannerwork/
+
+# Local workspace for credentials, test runners, private scratchpads.
+# Source scripts from here (gitignored so hostnames/tokens stay local).
+local/
+
+# SBOM / scan outputs — produced by the pipeline, not committed
+sbom*.json
+sbom*.xml
+*.cdx.json
+*.spdx.json
+grype-report.json
+trivy-report.json
+vulnerabilities.json
+# Canonical name (scripts/lib/artifact-names.sh):
+vuln-scan.json
+# Legacy names (renamed to vuln-scan.json / sbom.cdx.json):
+xray-scan.json
+xray-sbom.cdx.json
+
+# Auto-installed tool binaries (crane, syft) when not on PATH —
+# scripts/build.sh drops them here rather than /usr/local/bin so it
+# works without sudo on dev machines.
+.bin/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Python scratch (for test helpers if any)
+__pycache__/
+*.pyc
+.venv/

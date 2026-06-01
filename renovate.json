@@ -1,0 +1,37 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard"
+  ],
+  "dockerfile": {
+    "enabled": false,
+    "description": "DISABLED ON PURPOSE. The Dockerfile (and Dockerfile.example) carry ARG defaults like `ARG UPSTREAM_IMAGE=nginx` + `ARG CERT_BUILDER_IMAGE=docker.io/library/alpine:3.20` purely as fallbacks for direct `docker build .` invocations without the template's build.sh. In every real build, build.sh passes --build-arg from image.env, so those defaults are dead. Letting the dockerfile manager track them generates noise MRs ('bump nginx in Dockerfile.example') that nobody cares about. The customManager below tracks the ONE place that matters: UPSTREAM_REF in image.env."
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track the upstream image straight from image.env's UPSTREAM_REF URL. datasource is fixed (docker); depName, tag, and any pinned digest are parsed out of the URL itself — no per-repo `# renovate:` hint to keep in sync. The greedy depName group [^\"@\\s]+ swallows registry ports (registry:5000/app) so only the final `:tag` is captured as currentValue.",
+      "fileMatch": [
+        "(^|/)image\\.env(\\.example)?$"
+      ],
+      "matchStrings": [
+        "UPSTREAM_REF=\"?(?<depName>[^\"@\\s]+):(?<currentValue>[^\"@:/\\s]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?\"?"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Upstream base image bumps — auto-open MRs",
+      "matchManagers": ["custom.regex"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "labels": ["upstream-bump", "dependencies"],
+      "automerge": false
+    }
+  ],
+  "labels": ["dependencies"],
+  "commitMessagePrefix": "chore(deps):",
+  "prBodyTemplate": "{{{header}}}\n\n{{{table}}}\n\n{{{notes}}}\n\n{{{changelogs}}}\n\n{{{configDescription}}}\n\n{{{controls}}}\n\n{{{footer}}}"
+}
