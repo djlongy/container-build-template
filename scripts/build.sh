@@ -19,10 +19,20 @@
 #   remote manifest digest.
 #
 # Usage:
-#   ./scripts/build.sh            # build only, load into local daemon
-#   ./scripts/build.sh --push     # build + push via REGISTRY_KIND backend
-#   ./scripts/build.sh --dry-run  # resolve config + digest, no build
-#   ./scripts/build.sh --help     # full flag list
+#   ./scripts/build.sh                        # build only, load into local daemon
+#   ./scripts/build.sh --push                 # build + push via REGISTRY_KIND backend
+#   ./scripts/build.sh --dry-run              # resolve config + digest, no build
+#   ./scripts/build.sh --project-root <dir>   # per-image repo root (image.env,
+#                                             #   Dockerfile, certs/); default $PWD
+#   ./scripts/build.sh --env-file <path>      # alternate image.env, e.g. a
+#                                             #   dev/prod variant; default
+#                                             #   $PROJECT_ROOT/image.env
+#   ./scripts/build.sh --dockerfile <path>    # alternate Dockerfile;
+#                                             #   default ./Dockerfile
+#   ./scripts/build.sh --help                 # full flag list
+#
+#   Flags combine in any order. --help / _build_print_usage carries the
+#   authoritative per-flag descriptions.
 #
 # Required env when --push:
 #   REGISTRY_KIND       "harbor" (default) | "artifactory_jcr" | "artifactory_pro"
@@ -543,7 +553,7 @@ _build_derive_crane_url() {
   fi
 }
 
-# Try to install crane into ${PROJECT_ROOT}/.bin from CRANE_URL. Never
+# Try to install crane into ${HOME}/.local/bin from CRANE_URL. Never
 # fatal — returns 0 on success, 1 on failure (caller falls back).
 _build_install_crane() {
   if command -v crane >/dev/null 2>&1; then
@@ -560,12 +570,12 @@ _build_install_crane() {
   fi
 
   echo "→ crane not on PATH — installing from ${CRANE_URL}"
-  mkdir -p "${PROJECT_ROOT}/.bin"
+  mkdir -p "${HOME}/.local/bin"
   if curl -fSL --progress-bar --max-time 120 "${CRANE_URL}" \
-       | tar xz -C "${PROJECT_ROOT}/.bin" crane 2>/dev/null \
-     && [ -x "${PROJECT_ROOT}/.bin/crane" ]; then
-    export PATH="${PROJECT_ROOT}/.bin:${PATH}"
-    echo "  ✓ crane installed to ${PROJECT_ROOT}/.bin/crane ($(${PROJECT_ROOT}/.bin/crane version 2>&1 | head -1))"
+       | tar xz -C "${HOME}/.local/bin" crane 2>/dev/null \
+     && [ -x "${HOME}/.local/bin/crane" ]; then
+    export PATH="${HOME}/.local/bin:${PATH}"
+    echo "  ✓ crane installed to ${HOME}/.local/bin/crane ($(${HOME}/.local/bin/crane version 2>&1 | head -1))"
     return 0
   fi
 

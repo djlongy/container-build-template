@@ -88,11 +88,11 @@ if ! command -v grype >/dev/null 2>&1; then
   _url="${GRYPE_INSTALLER_URL:-https://raw.githubusercontent.com/anchore/grype/main/install.sh}"
   _ver="${GRYPE_VERSION:-v0.82.0}"
   echo "→ grype not on PATH — installing ${_ver} from ${_url}"
-  mkdir -p "${PROJECT_ROOT}/.bin"
+  mkdir -p "${HOME}/.local/bin"
   if curl -fsSL --max-time 120 "${_url}" \
-       | sh -s -- -b "${PROJECT_ROOT}/.bin" "${_ver}" >/dev/null 2>&1 \
-     && [ -x "${PROJECT_ROOT}/.bin/grype" ]; then
-    export PATH="${PROJECT_ROOT}/.bin:${PATH}"
+       | sh -s -- -b "${HOME}/.local/bin" "${_ver}" >/dev/null 2>&1 \
+     && [ -x "${HOME}/.local/bin/grype" ]; then
+    export PATH="${HOME}/.local/bin:${PATH}"
     echo "  ✓ grype installed ($(grype version 2>&1 | head -1))"
   else
     echo "ERROR: grype install failed — set GRYPE_INSTALLER_URL to a reachable mirror" >&2

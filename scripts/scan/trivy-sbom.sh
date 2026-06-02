@@ -101,11 +101,11 @@ TRIVY_VERSION="${TRIVY_VERSION:-0.69.3}"
 if ! command -v trivy >/dev/null 2>&1; then
   if [ -n "${TRIVY_BINARY_URL:-}" ]; then
     echo "→ trivy not on PATH — installing from TRIVY_BINARY_URL"
-    mkdir -p "${PROJECT_ROOT}/.bin"
+    mkdir -p "${HOME}/.local/bin"
     if curl -fsSL --max-time 120 "${TRIVY_BINARY_URL}" -o /tmp/trivy.tgz \
-       && tar xz -C "${PROJECT_ROOT}/.bin" -f /tmp/trivy.tgz trivy 2>/dev/null \
-       && [ -x "${PROJECT_ROOT}/.bin/trivy" ]; then
-      export PATH="${PROJECT_ROOT}/.bin:${PATH}"
+       && tar xz -C "${HOME}/.local/bin" -f /tmp/trivy.tgz trivy 2>/dev/null \
+       && [ -x "${HOME}/.local/bin/trivy" ]; then
+      export PATH="${HOME}/.local/bin:${PATH}"
       echo "  ✓ trivy installed ($(trivy --version 2>&1 | head -1))"
     else
       echo "ERROR: trivy install from TRIVY_BINARY_URL failed" >&2
@@ -114,11 +114,11 @@ if ! command -v trivy >/dev/null 2>&1; then
   else
     _url="${TRIVY_INSTALLER_URL:-https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh}"
     echo "→ trivy not on PATH — installing v${TRIVY_VERSION} from ${_url}"
-    mkdir -p "${PROJECT_ROOT}/.bin"
+    mkdir -p "${HOME}/.local/bin"
     if curl -fsSL --max-time 120 "${_url}" \
-         | sh -s -- -b "${PROJECT_ROOT}/.bin" "v${TRIVY_VERSION}" >/dev/null 2>&1 \
-       && [ -x "${PROJECT_ROOT}/.bin/trivy" ]; then
-      export PATH="${PROJECT_ROOT}/.bin:${PATH}"
+         | sh -s -- -b "${HOME}/.local/bin" "v${TRIVY_VERSION}" >/dev/null 2>&1 \
+       && [ -x "${HOME}/.local/bin/trivy" ]; then
+      export PATH="${HOME}/.local/bin:${PATH}"
       echo "  ✓ trivy installed ($(trivy --version 2>&1 | head -1))"
     else
       echo "ERROR: trivy install failed — set TRIVY_BINARY_URL to a reachable mirror" >&2

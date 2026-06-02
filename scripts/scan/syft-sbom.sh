@@ -94,11 +94,11 @@ if ! command -v syft >/dev/null 2>&1; then
   _url="${SYFT_INSTALLER_URL:-https://raw.githubusercontent.com/anchore/syft/main/install.sh}"
   _ver="${SYFT_VERSION:-v1.14.0}"
   echo "→ syft not on PATH — installing ${_ver} from ${_url}"
-  mkdir -p "${PROJECT_ROOT}/.bin"
+  mkdir -p "${HOME}/.local/bin"
   if curl -fsSL --max-time 120 "${_url}" \
-       | sh -s -- -b "${PROJECT_ROOT}/.bin" "${_ver}" >/dev/null 2>&1 \
-     && [ -x "${PROJECT_ROOT}/.bin/syft" ]; then
-    export PATH="${PROJECT_ROOT}/.bin:${PATH}"
+       | sh -s -- -b "${HOME}/.local/bin" "${_ver}" >/dev/null 2>&1 \
+     && [ -x "${HOME}/.local/bin/syft" ]; then
+    export PATH="${HOME}/.local/bin:${PATH}"
     echo "  ✓ syft installed ($(syft version 2>&1 | head -1))"
   else
     echo "ERROR: syft install failed — set SYFT_INSTALLER_URL to a reachable mirror" >&2
