@@ -136,6 +136,11 @@ Usage: ./scripts/build.sh [flags]
                            Set when invoking from a repo whose Dockerfile
                            lives under a different name (e.g. the template
                            repo's self-build uses Dockerfile.example).
+  --no-cache               Pass --no-cache to docker build/buildx, forcing
+                           every stage to rebuild from scratch (ignores the
+                           layer cache). Use to bypass a stale/corrupt local
+                           cache or to guarantee a fresh pull of upstream
+                           layers. Slower; no effect on the pushed artifact.
   --help, -h               This message.
 
   Flags can appear in any order. Without --push or --dry-run, build
@@ -177,6 +182,7 @@ EOF
 _build_parse_args() {
   WANT_PUSH=0
   WANT_DRY_RUN=0
+  WANT_NO_CACHE=0
   IMAGE_ENV_FILE=""
   DOCKERFILE="Dockerfile"
 
@@ -187,6 +193,7 @@ _build_parse_args() {
     case "$1" in
       --push)         WANT_PUSH=1; shift ;;
       --dry-run)      WANT_DRY_RUN=1; shift ;;
+      --no-cache)     WANT_NO_CACHE=1; shift ;;
       --project-root)
         if [ $# -lt 2 ] || [ -z "$2" ]; then
           echo "ERROR: --project-root requires a path argument" >&2
@@ -746,14 +753,42 @@ _build_docker_build() {
   # We don't consume buildx's provenance/SBOM attestations — Xray
   # covers provenance separately and Syft/Trivy/Xray + sbom-post.sh
   # cover SBOMs as their own stages — so disabling them is lossless.
+  # --no-cache passthrough. Valid for both the buildx and classic
+  # `docker build` invocations. Forces every stage (incl. the cert
+  # sidecar) to rebuild rather than reuse cached layers.
+  local cache_args=()
+  if [ "${WANT_NO_CACHE:-0}" -eq 1 ]; then
+    cache_args+=(--no-cache)
+    echo "→ --no-cache: rebuilding all stages, ignoring layer cache"
+  fi
+
   local _build_cmd=(docker build)
   if docker buildx version >/dev/null 2>&1; then
     _build_cmd=(docker buildx build --provenance=false --sbom=false --load)
     echo "→ docker buildx build (provenance/sbom disabled)"
   else
-    echo "→ docker build (buildx not detected — flat manifest by default)"
+    # No buildx plugin → we fall back to plain `docker build`. Force the
+    # BuildKit backend via DOCKER_BUILDKIT=1 so the build does NOT use the
+    # legacy graph-driver builder.
+    #
+    # WHY: the legacy builder stages multi-stage intermediate layers as
+    # dangling images in the shared daemon's graph driver. On a long-lived
+    # / shared CI runner those layers can be GC'd out from under an
+    # in-flight build (a concurrent job's `docker image prune`, a
+    # housekeeping cron, or a corrupt layerdb left by a prior interrupted
+    # build). When the final stage hits `COPY --from=certs-source ...` the
+    # builder then dies with "failed to find layer sha256:..." — even
+    # though the same Dockerfile builds cleanly on a quiet local daemon.
+    # BuildKit keeps its own content-addressed cache that `docker image
+    # prune` can't touch, so it is immune to this race. DOCKER_BUILDKIT=1
+    # works on any engine >= 18.09 (no buildx plugin required) and still
+    # produces a flat single manifest by default, matching the build-info
+    # merger's expectations.
+    export DOCKER_BUILDKIT=1
+    echo "→ docker build with DOCKER_BUILDKIT=1 (buildx not detected; BuildKit avoids the legacy 'failed to find layer' race)"
   fi
   "${_build_cmd[@]}" \
+    "${cache_args[@]}" \
     "${build_args[@]}" "${label_args[@]}" -t "${FULL_IMAGE}" \
     -f "${DOCKERFILE}" .
   echo "→ build complete: ${FULL_IMAGE}"
