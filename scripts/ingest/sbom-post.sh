@@ -221,8 +221,38 @@ else
   echo "→ dependency-track     POST ${DEPENDENCY_TRACK_URL}"
   rc=0
   (
-    ver="${UPSTREAM_TAG:-latest}"
-    bom_b64=$(base64 < "${SBOM_FILE}" | tr -d '\n')
+    # ── Build provenance (from build.env / env). Everything below is local
+    #    to this DT-sink subshell — other sinks are untouched. ──
+    # Project VERSION = the BUILT image tag (IMAGE_TAG = <upstream>-<gitShort>)
+    # so each commit is its own DT version (DT tracks SBOM history per version).
+    ver="${IMAGE_TAG:-${UPSTREAM_TAG:-latest}}"
+    dt_sha="${GIT_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+    dt_img="${IMAGE_REF:-${UPSTREAM_REF:-unknown}}"
+    dt_dig="${IMAGE_DIGEST:-}"
+    dt_repo="${DT_VCS_URL:-$(git config --get remote.origin.url 2>/dev/null || echo '')}"
+    dt_pipeline="${DT_BUILD_PIPELINE:-${CI_PROJECT_PATH:-container-build-template}}"
+
+    # ── (B) BOM-native: enrich a DT-ONLY copy of the SBOM with provenance as
+    #    metadata.component.externalReferences. DT persists THESE to the
+    #    project (visible under "External References"); it drops BOM/metadata
+    #    `properties`, so externalReferences is the BOM-native channel. The
+    #    enriched copy is DT-local — Splunk/webhook/Artifactory get the
+    #    original SBOM unchanged. Needs jq; without it we upload raw.
+    dt_bom="${SBOM_FILE}"
+    if command -v jq >/dev/null 2>&1; then
+      if jq --arg sha "${dt_sha}" --arg repo "${dt_repo}" --arg img "${dt_img}" --arg dig "${dt_dig}" '
+           ([ {type:"distribution", url:$img, comment:(if $dig=="" then "built image" else ("digest " + $dig) end)} ]
+            + (if ($repo|length)>0 and $repo!="unknown" then [{type:"vcs", url:$repo, comment:("commit " + $sha)}] else [] end)
+           ) as $refs
+           | .metadata = (.metadata // {})
+           | .metadata.component = (.metadata.component // {type:"container", name:$img})
+           | .metadata.component.externalReferences = ((.metadata.component.externalReferences // []) + $refs)
+         ' "${SBOM_FILE}" > "${_TMP}/dt-enriched.cdx.json" 2>/dev/null; then
+        dt_bom="${_TMP}/dt-enriched.cdx.json"
+      fi
+    fi
+
+    bom_b64=$(base64 < "${dt_bom}" | tr -d '\n')
     if command -v jq >/dev/null 2>&1; then
       payload=$(jq -nc \
         --arg name "${DEPENDENCY_TRACK_PROJECT}" \
@@ -232,13 +262,51 @@ else
     else
       payload="{\"projectName\":\"${DEPENDENCY_TRACK_PROJECT}\",\"projectVersion\":\"${ver}\",\"autoCreate\":true,\"bom\":\"${bom_b64}\"}"
     fi
-    curl -fsSL -X POST \
+    # DT's /api/v1/bom JSON path (base64 bom in a JSON body) is the PUT
+    # handler — @Consumes(application/json). The POST handler consumes
+    # ONLY multipart/form-data, so POST + application/json returns HTTP 415.
+    curl -fsSL -X PUT \
       -H "X-Api-Key: ${DEPENDENCY_TRACK_API_KEY}" \
       -H "Content-Type: application/json" \
       --data "${payload}" \
       "${DEPENDENCY_TRACK_URL%/}/api/v1/bom" -o "${_TMP}/dt.out"
     echo "  ✓ uploaded to project '${DEPENDENCY_TRACK_PROJECT}' v${ver}"
     [ -s "${_TMP}/dt.out" ] && echo "    response: $(cat "${_TMP}/dt.out")"
+
+    # ── (A) Project properties: post provenance as project-level KV (visible
+    #    under "Properties"). A BOM upload does NOT set these, so it's a
+    #    separate call that needs PORTFOLIO_MANAGEMENT on the API key. BEST
+    #    EFFORT: a 403 (key lacks the permission) is logged and skipped — the
+    #    upload + external references above still stand. Needs jq for lookup.
+    if command -v jq >/dev/null 2>&1; then
+      _puuid=$(curl -fsSL -H "X-Api-Key: ${DEPENDENCY_TRACK_API_KEY}" --get \
+        --data-urlencode "name=${DEPENDENCY_TRACK_PROJECT}" --data-urlencode "version=${ver}" \
+        "${DEPENDENCY_TRACK_URL%/}/api/v1/project/lookup" 2>/dev/null | jq -r '.uuid // empty')
+      if [ -n "${_puuid}" ]; then
+        _propfail=0
+        _dt_put_prop() {  # <name> <value> — group "newen", skip empty values
+          [ -n "$2" ] || return 0
+          local _code
+          _code=$(curl -sk -o /dev/null -w '%{http_code}' -X PUT \
+            -H "X-Api-Key: ${DEPENDENCY_TRACK_API_KEY}" -H "Content-Type: application/json" \
+            --data "$(jq -nc --arg n "$1" --arg v "$2" '{groupName:"newen", propertyName:$n, propertyValue:$v, propertyType:"STRING"}')" \
+            "${DEPENDENCY_TRACK_URL%/}/api/v1/project/${_puuid}/property")
+          case "${_code}" in 201|409) ;; 403) _propfail=403 ;; *) _propfail="${_code}" ;; esac
+        }
+        _dt_put_prop git_commit     "${dt_sha}"
+        _dt_put_prop scanned_image  "${dt_img}"
+        _dt_put_prop image_digest   "${dt_dig}"
+        _dt_put_prop image_tag      "${IMAGE_TAG:-}"
+        _dt_put_prop build_pipeline "${dt_pipeline}"
+        if [ "${_propfail}" = "403" ]; then
+          echo "    project properties skipped — API key lacks PORTFOLIO_MANAGEMENT (external refs + version still applied)"
+        elif [ "${_propfail}" != "0" ]; then
+          echo "    WARN: some project properties failed (HTTP ${_propfail})" >&2
+        else
+          echo "    ✓ project properties set (newen/: git_commit, scanned_image, image_digest, image_tag, build_pipeline)"
+        fi
+      fi
+    fi
   ) || rc=$?
   if [ "${rc}" -eq 0 ]; then
     posted=$((posted + 1))
