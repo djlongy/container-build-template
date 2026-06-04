@@ -693,6 +693,10 @@ sbom-ingest:
     - *install-tools
   script:
     - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+    # Self-test guard: a synthesized (git-untracked) image.env means this is
+    # the template's own validation run — skip ingest so nothing posts to
+    # Splunk/Artifactory. Real consumers commit image.env → proceed.
+    - git ls-files --error-unmatch image.env >/dev/null 2>&1 || { echo "→ self-test (no committed image.env) — skipping ingest, no sink posting"; exit 0; }
     - bash ./scripts/ingest/sbom-post.sh "${SBOM_FILE}"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
@@ -711,6 +715,9 @@ vuln-ingest:
     - *install-tools
   script:
     - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+    # Self-test guard (see sbom-ingest): synthesized/untracked image.env →
+    # skip ingest, post nothing.
+    - git ls-files --error-unmatch image.env >/dev/null 2>&1 || { echo "→ self-test (no committed image.env) — skipping ingest, no sink posting"; exit 0; }
     - bash ./scripts/ingest/vuln-post.sh "${VULN_SCAN_FILE}"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

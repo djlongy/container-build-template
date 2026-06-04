@@ -122,6 +122,16 @@ Build:
             export HARBOR_USER="${bamboo_svc_harbor_user:-${bamboo_HARBOR_USER:-}}"
             export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
 
+            # Self-test fixture: synthesize image.env from the committed
+            # example when absent, so the template's OWN plan validates the
+            # framework end-to-end. No-op for a real consumer (they commit
+            # image.env). Push is keyed off whether image.env is git-tracked
+            # (below), so a synthesized fixture never pushes.
+            if [ ! -f image.env ]; then
+              cp image.env.example image.env
+              echo "→ no committed image.env — synthesized from example (self-test, no-push)"
+            fi
+
             # Source image.env so CRANE_URL + ARTIFACTORY_USER are
             # available for the crane install + docker-config write.
             set -a; . ./image.env; set +a
@@ -170,12 +180,17 @@ Build:
               echo "→ no upstream creds for ${_UPS_HOST:-<none>} — base image pulled anonymously"
             fi
 
-            # Branch-aware push: main/master pushes; feature branches
-            # validate (build + scan) without pushing. build.sh handles
-            # its own docker login + jf install — don't do those here.
-            if [ "$bamboo_planRepository_branchName" = "main" ] || [ "$bamboo_planRepository_branchName" = "master" ]; then
+            # Push only when (a) image.env is git-TRACKED — a real consumer
+            # committed config, NOT this template's synthesized self-test
+            # fixture — AND (b) on main/master. Feature branches and the
+            # template's own self-test build + scan WITHOUT pushing. build.sh
+            # handles its own docker login + jf install — don't do those here.
+            if git ls-files --error-unmatch image.env >/dev/null 2>&1 \
+               && { [ "$bamboo_planRepository_branchName" = "main" ] || [ "$bamboo_planRepository_branchName" = "master" ]; }; then
+              echo "→ committed image.env on default branch → build + push"
               bash ./scripts/build.sh --push --dockerfile Dockerfile.example --project-root "$(pwd)"
             else
+              echo "→ self-test / feature branch → build WITHOUT push"
               bash ./scripts/build.sh --dockerfile Dockerfile.example --project-root "$(pwd)"
             fi
   artifacts:
@@ -210,7 +225,9 @@ Syft SBOM Postscan:
             export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
 
             # SBOM_FILE comes from build.env (canonical from
-            # scripts/lib/artifact-names.sh).
+            # scripts/lib/artifact-names.sh). Synthesize a self-test
+            # image.env if none is committed (no-op for real consumers).
+            [ -f image.env ] || cp image.env.example image.env
             bash ./scripts/scan/syft-sbom.sh
   artifacts:
     - name: sbom
@@ -229,6 +246,7 @@ Syft SBOM Prescan:
         interpreter: SHELL
         scripts:
           - |-
+            [ -f image.env ] || cp image.env.example image.env   # self-test fixture
             . ./image.env
             export SBOM_SCAN_REF="${UPSTREAM_REF}"
             bash ./scripts/scan/syft-sbom.sh
@@ -267,6 +285,7 @@ Grype Vuln:
 
             # Set GRYPE_FAIL_ON_SEVERITY="Critical" (or "Critical,High")
             # in image.env / plan vars to make this a hard gate.
+            [ -f image.env ] || cp image.env.example image.env   # self-test fixture
             bash ./scripts/scan/grype-vuln.sh
   artifacts:
     - name: vuln-scan-grype
@@ -294,6 +313,7 @@ Grype DB Sync:
 
             # `|| true` mirrors GitLab's optional-job semantics. Drop
             # the suffix to fail loudly on missing mirror config.
+            [ -f image.env ] || cp image.env.example image.env   # self-test fixture
             bash ./scripts/sync/mirror-grype-db.sh || true
   requirements:
     - system.docker.executable
@@ -326,6 +346,7 @@ Xray Vuln Prescan:
             export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 
+            [ -f image.env ] || cp image.env.example image.env   # self-test fixture
             . ./image.env
             export XRAY_SCAN_REF="${UPSTREAM_REF}"
             bash ./scripts/scan/xray-vuln.sh
@@ -350,6 +371,7 @@ Xray SBOM Prescan:
             export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 
+            [ -f image.env ] || cp image.env.example image.env   # self-test fixture
             . ./image.env
             export XRAY_SCAN_REF="${UPSTREAM_REF}"
             bash ./scripts/scan/xray-sbom.sh
@@ -383,6 +405,7 @@ Xray Vuln Postscan:
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 
             # IMAGE_DIGEST is in env from build.env — script auto-resolves.
+            [ -f image.env ] || cp image.env.example image.env   # self-test fixture
             bash ./scripts/scan/xray-vuln.sh
   artifacts:
     - name: xray-scan-postscan
@@ -411,6 +434,7 @@ Xray SBOM Postscan:
             export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 
+            [ -f image.env ] || cp image.env.example image.env   # self-test fixture
             bash ./scripts/scan/xray-sbom.sh
   artifacts:
     - name: xray-sbom-postscan
@@ -587,6 +611,12 @@ SBOM Ingest:
             set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
+            # Self-test guard: a synthesized (git-untracked) image.env means
+            # this is the template's own validation run — skip ingest so
+            # nothing posts to Splunk/Artifactory. Real consumers commit
+            # image.env → proceed.
+            git ls-files --error-unmatch image.env >/dev/null 2>&1 || { echo "→ self-test (no committed image.env) — skipping ingest, no sink posting"; exit 0; }
+
             # Ingest only on the default branch (mirrors GitLab's
             # `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` rule). Feature
             # branches build + scan (pipeline still completes green) but
@@ -622,6 +652,10 @@ Vuln Ingest:
           - |-
             set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            # Self-test guard (see SBOM Ingest): synthesized/untracked
+            # image.env → skip ingest, post nothing.
+            git ls-files --error-unmatch image.env >/dev/null 2>&1 || { echo "→ self-test (no committed image.env) — skipping ingest, no sink posting"; exit 0; }
 
             # Ingest only on the default branch (mirrors GitLab). Feature
             # branches build + scan but do NOT post — see Sbom Ingest note.
