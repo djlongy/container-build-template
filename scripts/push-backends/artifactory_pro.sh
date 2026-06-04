@@ -49,7 +49,7 @@
 # Auto-install (air-gap):
 #   JF_BINARY_URL, JF_DEB_URL, JF_RPM_URL, JF_INSTALL_DIR
 #
-# See image.env.example for what each variable does and its default.
+# See image.env.reference for what each variable does and its default.
 
 set -uo pipefail
 

@@ -65,6 +65,9 @@ _dbg() {
 # tags, project paths, etc. landed correctly.
 _redact_value() {
   local __name="$1" __value="$2"
+  # `*_KEY` (ends in _KEY) and `*_KEY_*` (has _KEY_ inside) are distinct
+  # masking globs; shellcheck's overlap heuristic mis-flags them.
+  # shellcheck disable=SC2221,SC2222
   case "${__name}" in
     *TOKEN*|*PASSWORD*|*SECRET*|*AUTH*|*_KEY|*_KEY_*|CA_CERT|COSIGN_KEY)
       if [ -z "${__value}" ]; then
@@ -183,7 +186,7 @@ load_image_env() {
 
   echo "→ Sourcing ${__env_file}"
   _dbg "image.env present at ${__env_file}"
-  # shellcheck disable=SC1091
+  # shellcheck disable=SC1090,SC1091
   . "${__env_file}"
 
   # Track which keys were overridden from the shell vs. taken straight

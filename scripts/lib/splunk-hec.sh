@@ -29,7 +29,7 @@
 #   is intended to be non-fatal at the caller — audit shipping is a
 #   side-effect, not the build's purpose.
 #
-# Reads from env (see image.env.example for full descriptions):
+# Reads from env (see image.env.reference for full descriptions):
 #   SPLUNK_HEC_URL          full base URL — /services/collector appended
 #                           if not already in the URL
 #   SPLUNK_HEC_TOKEN        HEC token — sent as Authorization: Splunk <tok>
@@ -74,7 +74,8 @@ splunk_hec_post() {
   fi
 
   mkdir -p "${_SPLUNK_TMPDIR}"
-  local envelope="${_SPLUNK_TMPDIR}/$(basename "${event_content_file}").hec.json"
+  local envelope
+  envelope="${_SPLUNK_TMPDIR}/$(basename "${event_content_file}").hec.json"
 
   # Sanitise URL: strip trailing slash, append /services/collector if absent.
   local hec_url="${SPLUNK_HEC_URL%/}"

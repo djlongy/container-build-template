@@ -41,7 +41,7 @@ import time
 
 # Prefixes whose matching env vars get included in build-info's
 # `properties.env.<name>` map sent to Artifactory. Keep this aligned
-# with the var families documented in image.env.example.
+# with the var families documented in image.env.reference.
 INCLUDE_PREFIXES = [
     # Backend selectors + namespaces
     "REGISTRY_KIND", "HARBOR_", "ARTIFACTORY_", "XRAY_",

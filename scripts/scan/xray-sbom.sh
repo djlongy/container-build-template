@@ -73,15 +73,9 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 export TEMPLATE_ROOT PROJECT_ROOT
 cd "${PROJECT_ROOT}"
 
-# shellcheck source=../lib/load-image-env.sh
-. "${TEMPLATE_ROOT}/scripts/lib/load-image-env.sh"
-# shellcheck source=../lib/artifact-names.sh
-. "${TEMPLATE_ROOT}/scripts/lib/artifact-names.sh"
-import_bamboo_vars
-load_image_env
-
-# Self-source build.env (latest IMAGE_DIGEST) so build.sh→scan needs no manual sourcing. See README "Running the scripts manually".
-[ -f build.env ] && { set -a; . ./build.env; set +a; }
+# shellcheck source=../lib/scan-common.sh
+. "${TEMPLATE_ROOT}/scripts/lib/scan-common.sh"
+scan_bootstrap
 
 # Opt-out gate
 if [ "${XRAY_GENERATE_SBOM:-true}" = "false" ]; then
@@ -89,26 +83,12 @@ if [ "${XRAY_GENERATE_SBOM:-true}" = "false" ]; then
   exit 0
 fi
 
-# ── Resolve scan target (mirrors xray-vuln.sh's chain) ────────────
+# ── Resolve scan target ($1 > XRAY_SCAN_REF > SBOM_SCAN_REF > … chain).
 # XRAY_SCAN_REF is the Xray-specific override; SBOM_SCAN_REF is the
-# generic SBOM-producer override honoured by syft-sbom.sh and
-# trivy-sbom.sh too, so swapping SBOM producers needs only one var.
-SCAN_REF="${1:-${XRAY_SCAN_REF:-${SBOM_SCAN_REF:-}}}"
-if [ -z "${SCAN_REF}" ]; then
-  if   [ -n "${IMAGE_DIGEST:-}" ];                                          then SCAN_REF="${IMAGE_DIGEST}"
-  elif [ -n "${IMAGE_REF:-}" ];                                             then SCAN_REF="${IMAGE_REF}"
-  elif [ -n "${UPSTREAM_REF:-}" ];                                          then SCAN_REF="${UPSTREAM_REF}"
-  elif [ -n "${UPSTREAM_REGISTRY:-}" ] && [ -n "${UPSTREAM_IMAGE:-}" ] && [ -n "${UPSTREAM_TAG:-}" ]; then
-    SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
-  fi
-fi
-if [ -z "${SCAN_REF}" ]; then
-  echo "ERROR: no scan target available." >&2
-  echo "  Resolution chain: \$1 > XRAY_SCAN_REF > SBOM_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF > UPSTREAM_REGISTRY/IMAGE:TAG" >&2
-  exit 1
-fi
+# generic SBOM-producer override (syft/trivy honour it too), so swapping
+# SBOM producers needs only one var.
+SCAN_REF="$(resolve_scan_ref "${1:-}" XRAY_SCAN_REF SBOM_SCAN_REF)" || exit 1
 echo "→ Scan target: ${SCAN_REF}"
-_dbg "(resolution: \$1=${1:-} XRAY_SCAN_REF=${XRAY_SCAN_REF:-} SBOM_SCAN_REF=${SBOM_SCAN_REF:-} IMAGE_DIGEST=${IMAGE_DIGEST:-} IMAGE_REF=${IMAGE_REF:-} UPSTREAM_REF=${UPSTREAM_REF:-})"
 
 # ── Phase 1 preconditions: scan-side Artifactory creds ────────────
 # PREFER the normal ARTIFACTORY_* creds (Xray usually shares the push
@@ -162,7 +142,7 @@ jf config use xray-sbom-server >/dev/null
 # ── Multi-registry docker login (mirrors xray-vuln.sh's flow) ─────
 # shellcheck source=../lib/docker-login.sh
 . "${TEMPLATE_ROOT}/scripts/lib/docker-login.sh"
-docker_login_for_xray_scan
+docker_login_all_registries
 
 # ── Pre-pull image ────────────────────────────────────────────────
 if ! command -v docker >/dev/null 2>&1; then

@@ -22,7 +22,7 @@
 # Either shell / CI env or image.env (committed). Precedence: shell
 # beats file. CI typically uses masked group/project variables; local
 # runs can populate image.env. (image.env.example is a template only,
-# never sourced — see image.env.example for documented descriptions.)
+# never sourced — see image.env.reference for documented descriptions.)
 #
 # Required variables:
 #   ARTIFACTORY_URL          e.g. https://artifactory.example.com

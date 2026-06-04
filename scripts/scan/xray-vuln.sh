@@ -82,40 +82,15 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 export TEMPLATE_ROOT PROJECT_ROOT
 cd "${PROJECT_ROOT}"
 
-# shellcheck source=../lib/load-image-env.sh
-. "${TEMPLATE_ROOT}/scripts/lib/load-image-env.sh"
-# shellcheck source=../lib/artifact-names.sh
-. "${TEMPLATE_ROOT}/scripts/lib/artifact-names.sh"
-import_bamboo_vars
-load_image_env
+# shellcheck source=../lib/scan-common.sh
+. "${TEMPLATE_ROOT}/scripts/lib/scan-common.sh"
+scan_bootstrap
 
-# Self-source build.env (latest IMAGE_DIGEST) so build.sh→scan needs no manual sourcing. See README "Running the scripts manually".
-[ -f build.env ] && { set -a; . ./build.env; set +a; }
-
-# ── Resolve scan target ─────────────────────────────────────────────
-# Default to the BUILT image (IMAGE_DIGEST from build.env, populated
-# by the build job's dotenv artifact). Falls back through tag → upstream
-# → constructed-upstream so the script also works for prescan use cases
-# where build hasn't run yet.
-SCAN_REF="${1:-${XRAY_SCAN_REF:-}}"
-if [ -z "${SCAN_REF}" ]; then
-  if   [ -n "${IMAGE_DIGEST:-}" ];                                          then SCAN_REF="${IMAGE_DIGEST}"
-  elif [ -n "${IMAGE_REF:-}" ];                                             then SCAN_REF="${IMAGE_REF}"
-  elif [ -n "${UPSTREAM_REF:-}" ];                                          then SCAN_REF="${UPSTREAM_REF}"
-  elif [ -n "${UPSTREAM_REGISTRY:-}" ] && [ -n "${UPSTREAM_IMAGE:-}" ] && [ -n "${UPSTREAM_TAG:-}" ]; then
-    SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
-  fi
-fi
-if [ -z "${SCAN_REF}" ]; then
-  echo "ERROR: no scan target available." >&2
-  echo "  Resolution chain: \$1 > XRAY_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF > UPSTREAM_REGISTRY/IMAGE:TAG" >&2
-  echo "  All empty. To scan after build, ensure build.env (with IMAGE_DIGEST) is" >&2
-  echo "  available. To scan upstream as a prescan, set UPSTREAM_REF in image.env" >&2
-  echo "  or pass a ref explicitly: bash scripts/scan/xray-vuln.sh <image-ref>" >&2
-  exit 1
-fi
+# ── Resolve scan target ($1 > XRAY_SCAN_REF > IMAGE_DIGEST > IMAGE_REF
+# > UPSTREAM_REF > assembled-upstream). Defaults to the BUILT image's
+# digest from build.env; also works for prescan (build hasn't run yet).
+SCAN_REF="$(resolve_scan_ref "${1:-}" XRAY_SCAN_REF)" || exit 1
 echo "→ Scan target: ${SCAN_REF}"
-_dbg "(resolution: \$1=${1:-} XRAY_SCAN_REF=${XRAY_SCAN_REF:-} IMAGE_DIGEST=${IMAGE_DIGEST:-} IMAGE_REF=${IMAGE_REF:-} UPSTREAM_REF=${UPSTREAM_REF:-})"
 
 # ── Phase 1 preconditions: resolve scan-side Artifactory creds ─────
 # PREFER the normal ARTIFACTORY_* creds — Xray almost always lives on the
@@ -176,7 +151,7 @@ jf config use xray-vuln-server >/dev/null
 # the login is harmless — public pulls work either way.
 # shellcheck source=../lib/docker-login.sh
 . "${TEMPLATE_ROOT}/scripts/lib/docker-login.sh"
-docker_login_for_xray_scan
+docker_login_all_registries
 
 # ── Pre-pull image so `jf docker scan → docker save` finds it ──────
 if ! command -v docker >/dev/null 2>&1; then

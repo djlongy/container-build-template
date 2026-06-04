@@ -57,15 +57,9 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 export TEMPLATE_ROOT PROJECT_ROOT
 cd "${PROJECT_ROOT}"
 
-# shellcheck source=../lib/load-image-env.sh
-. "${TEMPLATE_ROOT}/scripts/lib/load-image-env.sh"
-# shellcheck source=../lib/artifact-names.sh
-. "${TEMPLATE_ROOT}/scripts/lib/artifact-names.sh"
-import_bamboo_vars
-load_image_env
-
-# Self-source build.env (canonical SBOM_FILE/VULN_SCAN_FILE) so build.sh→scan needs no manual sourcing. See README "Running the scripts manually".
-[ -f build.env ] && { set -a; . ./build.env; set +a; }
+# shellcheck source=../lib/scan-common.sh
+. "${TEMPLATE_ROOT}/scripts/lib/scan-common.sh"
+scan_bootstrap
 
 # ── Resolve input SBOM ─────────────────────────────────────────────
 SBOM_IN="${1:-${SBOM_FILE}}"
@@ -122,8 +116,9 @@ fi
 
 # ── Run the scan ───────────────────────────────────────────────────
 echo "→ grype sbom:${SBOM_IN} → ${SCAN_OUT}"
-grype "sbom:${SBOM_IN}" --output json --file "${SCAN_OUT}" --fail-on "" || true
-grype "sbom:${SBOM_IN}" --output table || true
+# One invocation emits BOTH outputs — JSON to the file, table to stdout
+# — so the CVE DB loads once (was two full grype runs).
+grype "sbom:${SBOM_IN}" --fail-on "" -o "json=${SCAN_OUT}" -o table || true
 
 if [ ! -s "${SCAN_OUT}" ]; then
   echo "ERROR: grype produced no output (rc=$?)" >&2

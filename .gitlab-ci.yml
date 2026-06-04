@@ -8,7 +8,10 @@
 # includes, no template indirection. A newcomer can read this one
 # file and see the entire flow.
 #
-# Pipeline shape (5 stages; sign commented out, promote dropped):
+# Pipeline shape (6 stages; sign commented out, promote dropped):
+#   qa        → shellcheck (always) + SonarQube (opt-in, set
+#               SONAR_HOST_URL + SONAR_TOKEN) static-analyse the
+#               framework scripts before anything builds.
 #   prescan   → scan UPSTREAM_REF before build. 3 SBOM + 2 vuln
 #               producers run in parallel; downstream picks up via
 #               canonical SBOM_FILE / VULN_SCAN_FILE.
@@ -33,6 +36,7 @@
 # production".
 
 stages:
+  - qa           # shellcheck (always) + SonarQube (opt-in) of the framework
   - prescan      # Xray scan + SBOM of UPSTREAM_REF
   - build
   - postscan     # Xray scan + SBOM of the BUILT image, Syft SBOM, Grype
@@ -120,6 +124,43 @@ variables:
   # mirrors the Anchore DB to that repo and grype-vuln pulls from it.
   ARTIFACTORY_GRYPE_DB_REPO: ""
   GRYPE_DB_MIRROR_SUBPATH: "grype-db/v6"
+
+# ═══════════════════════════════════════════════════════════════════
+# QA STAGE — static analysis of the framework itself (runs first)
+# ═══════════════════════════════════════════════════════════════════
+# shellcheck always runs (no infra, no secrets). SonarQube is OPT-IN:
+# its job only materialises where SONAR_HOST_URL + SONAR_TOKEN are set
+# as CI variables, so no internal Sonar URL is ever committed and the
+# public mirror simply skips it.
+
+shellcheck:
+  stage: qa
+  image: koalaman/shellcheck-alpine:stable
+  script:
+    - shellcheck --version
+    # -x follows `source`d libs. Gate at warning+ (errors + warnings
+    # fail the pipeline); info/style remain advisory.
+    - shellcheck -x -S warning $(find . -name '*.sh' -type f | sort)
+  rules: *build-rules
+
+sonarqube:
+  stage: qa
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"          # full history → accurate blame/new-code
+  cache:
+    key: "sonar-cache"
+    paths:
+      - .sonar/cache
+  script:
+    - sonar-scanner -Dsonar.host.url="${SONAR_HOST_URL}" -Dsonar.token="${SONAR_TOKEN}"
+  allow_failure: true       # QA signal, never blocks the build
+  rules:
+    # Opt-in: host + token come from CI variables (internal only).
+    - if: '$SONAR_HOST_URL && $SONAR_TOKEN'
 
 # ── Shared before_script: install tools used by most jobs ──────────
 .install-tools: &install-tools

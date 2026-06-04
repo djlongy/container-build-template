@@ -16,7 +16,7 @@
 # ── Where do the sink env vars come from? ────────────────────────────
 # Either shell / CI env or image.env (committed). Precedence: shell
 # beats file. In CI these are typically masked group/project variables;
-# locally they sit in image.env. See image.env.example for descriptions
+# locally they sit in image.env. See image.env.reference for descriptions
 # (template only — image.env.example is never read by the build).
 #
 # This script self-loads image.env via scripts/lib/load-image-env.sh —

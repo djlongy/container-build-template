@@ -69,7 +69,8 @@ $EDITOR image.env
 ./scripts/build.sh --push
 ```
 
-Every knob is documented inline in `image.env.example`.
+`image.env.example` is the slim starter (the required knob + the common
+backends). Every other option is documented in `image.env.reference`.
 
 ## Required CI variables — secrets only
 
@@ -298,7 +299,8 @@ first) and the `grype-vuln` job will pull from your mirror automatically.
 ```
 container-build-template/
 ├── image.env                  # ★ Per-fork live config (REQUIRED, committed). EDIT
-├── image.env.example          # Template reference — copy to image.env. NEVER sourced
+├── image.env.example          # ★ Slim starter — copy to image.env. NEVER sourced
+├── image.env.reference        # Full annotated option set (copy extra lines from here)
 ├── Dockerfile.example         # Template — copy to Dockerfile. Edit only FORK EDITS region
 ├── inject-certs.sh            # Vendored verbatim into per-image repos
 ├── install-ca-certificates.sh # Vendored verbatim into per-image repos

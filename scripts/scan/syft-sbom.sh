@@ -56,39 +56,19 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 export TEMPLATE_ROOT PROJECT_ROOT
 cd "${PROJECT_ROOT}"
 
-# shellcheck source=../lib/load-image-env.sh
-. "${TEMPLATE_ROOT}/scripts/lib/load-image-env.sh"
-# shellcheck source=../lib/artifact-names.sh
-. "${TEMPLATE_ROOT}/scripts/lib/artifact-names.sh"
-import_bamboo_vars
-load_image_env
-
-# Self-source build.env (latest IMAGE_DIGEST) so build.sh→scan needs no manual sourcing. See README "Running the scripts manually".
-[ -f build.env ] && { set -a; . ./build.env; set +a; }
+# shellcheck source=../lib/scan-common.sh
+. "${TEMPLATE_ROOT}/scripts/lib/scan-common.sh"
+scan_bootstrap
 
 # ── Resolve scan target ─────────────────────────────────────────────
+# SBOM_TARGET=source scans the working tree (dir:) when no explicit ref
+# is given; otherwise resolve via the shared chain ($1 > SBOM_SCAN_REF >
+# IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF > assembled-upstream).
 SBOM_TARGET="$(printf '%s' "${SBOM_TARGET:-image}" | tr '[:upper:]' '[:lower:]')"
-SCAN_REF="${1:-${SBOM_SCAN_REF:-}}"
-if [ -z "${SCAN_REF}" ]; then
-  case "${SBOM_TARGET}" in
-    source) SCAN_REF="dir:${PROJECT_ROOT}" ;;
-    image|*)
-      if   [ -n "${IMAGE_DIGEST:-}" ];                                          then SCAN_REF="${IMAGE_DIGEST}"
-      elif [ -n "${IMAGE_REF:-}" ];                                             then SCAN_REF="${IMAGE_REF}"
-      elif [ -n "${UPSTREAM_REF:-}" ];                                          then SCAN_REF="${UPSTREAM_REF}"
-      elif [ -n "${UPSTREAM_REGISTRY:-}" ] && [ -n "${UPSTREAM_IMAGE:-}" ] && [ -n "${UPSTREAM_TAG:-}" ]; then
-        SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
-      fi
-      ;;
-  esac
-fi
-if [ -z "${SCAN_REF}" ]; then
-  echo "ERROR: no scan target available." >&2
-  echo "  Resolution chain: \$1 > SBOM_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF > UPSTREAM_REGISTRY/IMAGE:TAG" >&2
-  echo "  All empty. To scan after build, ensure build.env (with IMAGE_DIGEST)" >&2
-  echo "  is on disk. To scan upstream as a prescan, set UPSTREAM_REF in image.env" >&2
-  echo "  or pass a ref explicitly: bash scripts/scan/syft-sbom.sh <image-ref>" >&2
-  exit 1
+if [ "${SBOM_TARGET}" = "source" ] && [ -z "${1:-}" ] && [ -z "${SBOM_SCAN_REF:-}" ]; then
+  SCAN_REF="dir:${PROJECT_ROOT}"
+else
+  SCAN_REF="$(resolve_scan_ref "${1:-}" SBOM_SCAN_REF)" || exit 1
 fi
 echo "→ Scan target: ${SCAN_REF}"
 
@@ -115,7 +95,7 @@ fi
 if [ "${SCAN_REF#dir:}" = "${SCAN_REF}" ] && command -v docker >/dev/null 2>&1; then
   # shellcheck source=../lib/docker-login.sh
   . "${TEMPLATE_ROOT}/scripts/lib/docker-login.sh"
-  docker_login_for_xray_scan || true
+  docker_login_all_registries || true
 fi
 
 # ── Generate the SBOM ───────────────────────────────────────────────

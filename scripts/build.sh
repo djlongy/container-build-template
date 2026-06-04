@@ -33,7 +33,7 @@
 #                          ARTIFACTORY_TEAM
 #     artifactory_pro   → same as jcr, plus optional ARTIFACTORY_PROJECT
 #
-# Optional env: see image.env.example. Highlights:
+# Optional env: see image.env.reference. Highlights:
 #   IMAGE_NAME          default: leaf of UPSTREAM_IMAGE
 #   ORIGINAL_USER       auto-detected via `crane config`
 #   CA_CERT             PEM → certs/ci-injected.crt (cert sidecar)
@@ -46,30 +46,11 @@
 
 set -euo pipefail
 
-# ════════════════════════════════════════════════════════════════════
-# Root-path decoupling — TEMPLATE_ROOT vs PROJECT_ROOT
-# ════════════════════════════════════════════════════════════════════
-# This template is designed to be cloned-and-invoked by per-image repos:
-#
-#     git clone --depth 1 ${TEMPLATE_REPO} .template
-#     cd <per-image-repo>        # has image.env + Dockerfile + certs/
-#     bash .template/scripts/build.sh
-#
-# Two distinct roots are needed:
-#
-#   TEMPLATE_ROOT  where THIS script (and its sibling libs / push backends
-#                  / scan scripts) lives. Computed from BASH_SOURCE.
-#                  Read-only; never the place artifacts land.
-#
-#   PROJECT_ROOT   where image.env, Dockerfile, certs/ live, and where
-#                  build.env / sbom.cdx.json / vuln-scan.json land.
-#                  Defaults to the operator's CWD at invocation. Override
-#                  via --project-root <path> or the PROJECT_ROOT env var
-#                  for callers that can't cd first.
-#
-# When the per-image repo IS the template repo (e.g. running the
-# template's own self-tests), the two coincide and the contract still
-# works — no special handling needed.
+# ── Two roots: TEMPLATE_ROOT (scripts, read-only, from BASH_SOURCE) vs
+# PROJECT_ROOT (image.env/Dockerfile/certs + where build.env/SBOM/scan
+# artifacts land; defaults to CWD, override with --project-root or the
+# PROJECT_ROOT env var). They coincide when the template builds itself.
+# See docs/DESIGN.md "Two roots".
 TEMPLATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # PROJECT_ROOT defaults to CWD; _build_parse_args may override via flag.
 # Re-export so child scripts (scan/scan-*.sh, ingest/sbom-post.sh)
@@ -77,19 +58,9 @@ TEMPLATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 export TEMPLATE_ROOT
 
-# ════════════════════════════════════════════════════════════════════
-# Shared lib: image.env loader + bamboo_* importer + _dbg
-# ════════════════════════════════════════════════════════════════════
-# scripts/lib/load-image-env.sh provides:
-#   _dbg <msg>            — debug echo (BUILD_DEBUG=true to enable)
-#   import_bamboo_vars    — translate bamboo_* env vars to bare names
-#   load_image_env [path] — source <path> (default ./image.env in CWD),
-#                           apply shell-set overrides on top
-#
-# Sourced once here. Other scripts (scan/xray-vuln.sh, scan/xray-sbom.sh,
-# sbom-post.sh) source the same lib so all config loading goes through
-# the same code path — same precedence, same debug logs, same fail-fast
-# message on missing image.env.
+# ── Shared lib: provides _dbg, import_bamboo_vars (bamboo_* → bare),
+# and load_image_env (source image.env, shell/CI overrides win). Every
+# script sources it, so config loading is one code path everywhere.
 # shellcheck source=lib/load-image-env.sh
 . "${TEMPLATE_ROOT}/scripts/lib/load-image-env.sh"
 # shellcheck source=lib/artifact-names.sh
@@ -137,7 +108,7 @@ the final USER flip. Use that region for RUN \`apk upgrade\`/\`apt-get
 upgrade\` (CVE remediation), package installs, COPY of static configs,
 ENV/HEALTHCHECK lines, etc.
 
-All behavioural toggles are env-driven. See image.env.example for the
+All behavioural toggles are env-driven. See image.env.reference for the
 full list. Commonly-used flags:
 
   REGISTRY_KIND=artifactory_jcr   use scripts/push-backends/artifactory_jcr.sh
@@ -380,21 +351,11 @@ _build_compute_tag() {
   fi
 
   # ── Reproducible build timestamp (SOURCE_DATE_EPOCH) ──────────────
-  # Two consecutive `--push` of the SAME commit must produce the SAME
-  # image digest. The only thing that used to differ between runs was
-  # CREATED=$(date now), which fed org.opencontainers.image.created and
-  # (via BuildKit) the image config's own timestamps — so each build
-  # got a fresh manifest digest, the re-push ORPHANED the previous
-  # digest in the registry, and any scan still holding that digest
-  # failed immediately ("manifest not found").
-  #
-  # Fix: anchor the build clock to the git COMMIT time. BuildKit honours
-  # SOURCE_DATE_EPOCH (clamps layer + config timestamps), so identical
-  # source → identical digest, and a re-push is a no-op overwrite to the
-  # same digest (nothing orphaned). Precedence:
-  #   1. SOURCE_DATE_EPOCH already in env  → respected (CI override)
-  #   2. git committer date of HEAD        → reproducible per commit
-  #   3. wall clock (no git)               → last resort, non-reproducible
+  # Anchor the build clock to the git COMMIT time so the same commit
+  # rebuilds to the SAME digest (a re-push then overwrites in place
+  # instead of orphaning the old digest and breaking scans-by-digest).
+  # Precedence: env override > git committer date > wall clock (no git,
+  # not reproducible). See docs/DESIGN.md "Reproducible build digest".
   if [ -z "${SOURCE_DATE_EPOCH:-}" ] && [ "${GIT_SHA}" != "unknown" ]; then
     SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD 2>/dev/null || echo "")
   fi
@@ -749,28 +710,12 @@ _build_docker_build() {
     label_args+=(--label "org.opencontainers.image.url=${SOURCE_URL}")
   fi
 
-  # Detect buildx and toggle the attestation flags accordingly.
-  #
-  # When buildx is present (Docker Desktop, Colima vz-rosetta, modern
-  # Docker Engine with the buildx plugin) we pass `--provenance=false
-  # --sbom=false` to force a FLAT single-arch v2 distribution manifest
-  # (config + layers in the tag dir) instead of an OCI image index
-  # wrapping the manifest + an attestation manifest. The index lands
-  # in JFrog as <tag>/list.manifest.json with the layer blobs at
-  # <repo>/<image>/sha256:<digest>/ rather than in the tag dir, which
-  # makes our Free-tier build-info merger (lib/build-info-merge.py)
-  # report "1 artifact, 0 dependencies (fallback)" instead of the
-  # proper "manifest + config + N layers" count.
-  #
-  # When buildx is NOT installed (some hosted CI runners ship plain
-  # Docker Engine), `docker build` rejects those flags as unknown,
-  # so we fall back to a vanilla `docker build` — non-buildx Docker
-  # never produces OCI indices anyway, so the flags wouldn't have
-  # served any purpose there.
-  #
-  # We don't consume buildx's provenance/SBOM attestations — Xray
-  # covers provenance separately and Syft/Trivy/Xray + sbom-post.sh
-  # cover SBOMs as their own stages — so disabling them is lossless.
+  # Detect buildx; when present, force a FLAT single-arch manifest with
+  # `--provenance=false --sbom=false` (an OCI index breaks the Free-tier
+  # build-info merger). Plain Docker Engine rejects those flags and never
+  # makes an index anyway, so fall back to vanilla `docker build`. We
+  # don't use buildx attestations (Xray/Syft/Trivy cover that), so this
+  # is lossless. See docs/DESIGN.md "buildx attestation flags".
   local _build_cmd=(docker build)
   if docker buildx version >/dev/null 2>&1; then
     _build_cmd=(docker buildx build --provenance=false --sbom=false --load)
@@ -794,33 +739,17 @@ _build_docker_build() {
 # ════════════════════════════════════════════════════════════════════
 # PHASE 8a — Local build.env (always)
 # ════════════════════════════════════════════════════════════════════
-# Emit build.env immediately after docker build, BEFORE the optional
-# push step. This guarantees downstream CI stages always find the
-# canonical artifact — feature-branch pipelines that only build (no
-# --push) still produce something for prescan/postscan/test jobs to
-# consume. MR-to-main gates require a full green pipeline including
-# the postscan stages, so this no-push build.env has to be SCANNABLE
-# from a fresh container in a downstream job.
-#
-# IMAGE_REF policy (no-push path):
-#   IMAGE_REF=${UPSTREAM_REF}    — fully-qualified, pullable from any
-#                                   runner. The local docker tag
-#                                   ${FULL_IMAGE} is bare image:tag
-#                                   and won't resolve in a downstream
-#                                   job's fresh dind/runner. The
-#                                   built image's content is identical
-#                                   to upstream + cert-sidecar tweak,
-#                                   so scanning upstream is a valid
-#                                   pipeline-validation proxy.
-#   LOCAL_IMAGE=${FULL_IMAGE}    — preserved separately so a same-
-#                                   daemon scan (local dev / a runner
-#                                   that shares dind across jobs) can
-#                                   prefer the actually-built artifact.
-#   IMAGE_DIGEST=                — empty (no remote manifest exists).
-#
-# When --push runs in PHASE 8b, the push backend overwrites this file
-# with the registry URL + remote @sha256 digest, so IMAGE_REF then
-# points at the real artifact.
+# Emit build.env right after docker build, BEFORE the optional push, so
+# build-only (no --push) feature-branch pipelines still produce a
+# scannable artifact for prescan/postscan/test jobs. No-push values:
+#   IMAGE_REF=${UPSTREAM_REF}   pullable from any runner (the local tag
+#                               won't resolve in a fresh dind; built
+#                               content = upstream + cert tweak, a valid
+#                               scan proxy)
+#   LOCAL_IMAGE=${FULL_IMAGE}   for a same-daemon scan to prefer the build
+#   IMAGE_DIGEST=               empty (no remote manifest yet)
+# --push (PHASE 8b) overwrites build.env with the registry URL + remote
+# @sha256 digest. See docs/DESIGN.md "build.env policy on the no-push path".
 
 _build_emit_local_build_env() {
   cat > build.env <<EOF
@@ -860,7 +789,7 @@ EOF
 # changing REGISTRY_KIND in image.env.
 #
 # REGISTRY_KIND defaults to "harbor" (plain docker push). Other
-# shipped backends: "artifactory".
+# shipped backends: "artifactory_jcr", "artifactory_pro".
 
 _build_push_and_emit_env() {
   if [ "${WANT_PUSH}" -ne 1 ]; then
@@ -915,7 +844,7 @@ _build_validate_backend          # fail-fast on missing HARBOR_*/ARTIFACTORY_*
 # (UPSTREAM_REGISTRY_USER + UPSTREAM_REGISTRY_PASSWORD) — see docker-login.sh.
 # shellcheck source=lib/docker-login.sh
 . "${TEMPLATE_ROOT}/scripts/lib/docker-login.sh"
-docker_login_for_xray_scan || true
+docker_login_all_registries || true
 
 _build_print_config_report
 _build_resolve_base_digest

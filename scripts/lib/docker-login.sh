@@ -13,7 +13,7 @@
 #
 # Provides one function:
 #
-#   docker_login_for_xray_scan
+#   docker_login_all_registries
 #     Attempts a non-fatal docker login against the hosts it has creds
 #     for:
 #     - HARBOR_REGISTRY                (default Harbor backend)
@@ -53,7 +53,7 @@
 # shellcheck disable=SC2148
 # (sourced, not executed)
 
-docker_login_for_xray_scan() {
+docker_login_all_registries() {
   if ! command -v docker >/dev/null 2>&1; then
     echo "  WARN: docker CLI not on PATH — skipping login (subsequent pull will likely fail)" >&2
     return 0
