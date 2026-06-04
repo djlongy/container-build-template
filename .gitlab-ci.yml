@@ -195,6 +195,18 @@ sonarqube:
       fi
     fi
   - |
+    # Self-test fixture. This template repo commits NO image.env (that's
+    # the consumer's job), so its OWN pipeline would otherwise fail at
+    # load_image_env. Synthesize one from the committed example so the
+    # framework is validated end-to-end (build → scan → ingest) with no
+    # real config. A real consumer HAS image.env committed → this is a
+    # no-op for them. The build job keys "push vs no-push" off whether
+    # image.env is git-tracked, so a synthesized one never pushes.
+    if [ ! -f image.env ]; then
+      cp image.env.example image.env
+      echo "→ no committed image.env — synthesized from image.env.example (template self-test, no-push)"
+    fi
+  - |
     # Source image.env with shell-wins-over-file precedence so CI vars
     # / pipeline-trigger vars override image.env values. GitLab's
     # default shell is busybox /bin/sh, which can't run our bash-only
@@ -268,15 +280,19 @@ build:
   before_script:
     - *install-tools
   script:
-    # Branch-aware push: only default branch + tags push to registry.
-    # Feature/MR pipelines build + scan as validation without pushing
-    # so short-lived branches don't pollute the registry. build.sh's
-    # no-push path still emits build.env with IMAGE_REF=UPSTREAM_REF
-    # for downstream postscan jobs.
+    # Push only when (a) image.env is git-tracked — i.e. a real consumer
+    # committed config, NOT this template's synthesized self-test fixture
+    # — AND (b) on the default branch / a tag. Feature/MR pipelines and
+    # the template's own self-test build + scan WITHOUT pushing (nothing
+    # hits the registry; build.sh's no-push path still emits build.env
+    # with IMAGE_REF=UPSTREAM_REF for downstream postscan jobs).
     - |
-      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ] || [ -n "$CI_COMMIT_TAG" ]; then
+      if git ls-files --error-unmatch image.env >/dev/null 2>&1 \
+         && { [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ] || [ -n "$CI_COMMIT_TAG" ]; }; then
+        echo "→ committed image.env on default branch/tag → build + push"
         bash ./scripts/build.sh --push --dockerfile Dockerfile.example
       else
+        echo "→ self-test / feature branch → build WITHOUT push"
         bash ./scripts/build.sh --dockerfile Dockerfile.example
       fi
   artifacts:
