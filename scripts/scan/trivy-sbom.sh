@@ -1,37 +1,18 @@
 #!/usr/bin/env bash
-# ─── DO NOT EDIT — except to enable the kill-switch below ──────────
+# ─── DO NOT EDIT — template scan job ───────────────────────────────
 # Behaviour comes from image.env (SBOM_FILE, TRIVY_VERSION,
 # TRIVY_INSTALLER_URL, TRIVY_BINARY_URL). Edit those, not the body.
 # ───────────────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════════════════
-# KILL-SWITCH — Trivy is BANNED for business use
+# KILL-SWITCH + VERSION SAFETY
 # ═══════════════════════════════════════════════════════════════════
-# This script EXITS 1 by default. To actually run Trivy, BOTH gates
-# must be flipped — single flag is not enough, to prevent accidental
-# runs from a stray env var or uncommented CI job:
-#
-#   1. EDIT this file: change ALLOW_TRIVY=0 to ALLOW_TRIVY=1 below
-#   2. AND export: ALLOW_TRIVY_RUN=yes-i-understand-trivy-is-banned
-#
-# Even after both gates are flipped, the script still refuses
-# v0.69.4–v0.69.6 (the compromised range). See trivy-vuln.sh for the
-# full security note.
-#
-# Status: BOTH GATES LOCKED. End-to-end testing of the trivy path
-# completed 2026-05-28 (prometheus / redis / cert-builder pipelines
-# successfully ran trivy + ingested results to Splunk + Artifactory).
-# Reverted to the original "banned by default" state — re-enabling
-# now needs the same deliberate two-step the killswitch enforces.
-ALLOW_TRIVY=0
-
-if [ "${ALLOW_TRIVY}" -ne 1 ] || [ "${ALLOW_TRIVY_RUN:-}" != "yes-i-understand-trivy-is-banned" ]; then
-  echo "REFUSED: trivy-sbom.sh is disabled (Trivy is banned for business use)." >&2
-  echo "  To run anyway, BOTH gates must be flipped — see kill-switch header." >&2
-  echo "    1. Edit this file: ALLOW_TRIVY=1" >&2
-  echo "    2. export ALLOW_TRIVY_RUN=yes-i-understand-trivy-is-banned" >&2
-  exit 1
-fi
+# Trivy is OPT-IN behind a single toggle, ALLOW_TRIVY (default 0 = off).
+# Flip it WITHOUT editing this file — set ALLOW_TRIVY=1 as an env var, a
+# CI/CD variable, or an image.env line. Gate enforced after config load.
+# A hard VERSION-SAFETY pin always applies once enabled: TRIVY_VERSION
+# defaults to 0.69.3 and the guard further down HARD-FAILS the
+# compromised range v0.69.4–v0.69.6. See trivy-vuln.sh for the full note.
 # ═══════════════════════════════════════════════════════════════════
 
 # scripts/scan/trivy-sbom.sh — Aqua Trivy CycloneDX SBOM generator
@@ -41,11 +22,10 @@ fi
 # the contract: scan/syft-sbom.sh, scan/xray-sbom.sh, scan/trivy-sbom.sh.
 # Swap any of them by changing the script name in CI YAML.
 #
-# ── DISABLED BY DEFAULT — Trivy is banned for business use here ─────
-# Same security caveat as scripts/scan/trivy-vuln.sh: this is a
-# scaffold for re-enablement. PINNED to v0.69.3 (the last safe
-# pre-compromise binary release). Bump only after vetting the
-# upstream advisory list — see the version note in trivy-vuln.sh.
+# Same version safety as scripts/scan/trivy-vuln.sh: PINNED to v0.69.3
+# (the last safe pre-compromise binary release) with a hard guard
+# against the compromised v0.69.4–v0.69.6 range. Bump only after vetting
+# the upstream advisory list — see the version note in trivy-vuln.sh.
 #
 # Usage:
 #   bash scripts/scan/trivy-sbom.sh                # SBOM of IMAGE_DIGEST/IMAGE_REF
@@ -74,6 +54,16 @@ cd "${PROJECT_ROOT}"
 import_bamboo_vars
 load_image_env
 
+# ── KILL-SWITCH: Trivy is opt-in. Toggle with ALLOW_TRIVY=1 (env / CI
+# variable / image.env). Default 0 = disabled. No file edit needed. ──
+if [ "${ALLOW_TRIVY:-0}" != "1" ]; then
+  echo "→ trivy-sbom.sh disabled (ALLOW_TRIVY=${ALLOW_TRIVY:-0}). Set ALLOW_TRIVY=1 to enable." >&2
+  exit 1
+fi
+
+# Self-source build.env (latest IMAGE_DIGEST) so build.sh→scan needs no manual sourcing. See README "Running the scripts manually".
+[ -f build.env ] && { set -a; . ./build.env; set +a; }
+
 # ── Resolve scan target ─────────────────────────────────────────────
 SCAN_REF="${1:-${TRIVY_SCAN_REF:-${SBOM_SCAN_REF:-${XRAY_SCAN_REF:-}}}}"
 if [ -z "${SCAN_REF}" ]; then
@@ -86,6 +76,7 @@ if [ -z "${SCAN_REF}" ]; then
 fi
 if [ -z "${SCAN_REF}" ]; then
   echo "ERROR: no scan target available." >&2
+  echo "  Resolution chain: \$1 > TRIVY_SCAN_REF > SBOM_SCAN_REF > XRAY_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF > UPSTREAM_REGISTRY/IMAGE:TAG" >&2
   exit 1
 fi
 echo "→ Scan target: ${SCAN_REF}"

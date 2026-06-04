@@ -89,6 +89,9 @@ cd "${PROJECT_ROOT}"
 import_bamboo_vars
 load_image_env
 
+# Self-source build.env (latest IMAGE_DIGEST) so build.sh→scan needs no manual sourcing. See README "Running the scripts manually".
+[ -f build.env ] && { set -a; . ./build.env; set +a; }
+
 # ── Resolve scan target ─────────────────────────────────────────────
 # Default to the BUILT image (IMAGE_DIGEST from build.env, populated
 # by the build job's dotenv artifact). Falls back through tag → upstream
@@ -115,10 +118,15 @@ echo "→ Scan target: ${SCAN_REF}"
 _dbg "(resolution: \$1=${1:-} XRAY_SCAN_REF=${XRAY_SCAN_REF:-} IMAGE_DIGEST=${IMAGE_DIGEST:-} IMAGE_REF=${IMAGE_REF:-} UPSTREAM_REF=${UPSTREAM_REF:-})"
 
 # ── Phase 1 preconditions: resolve scan-side Artifactory creds ─────
-SCAN_ART_URL="${XRAY_ARTIFACTORY_URL:-${ARTIFACTORY_URL:-}}"
-SCAN_ART_USER="${XRAY_ARTIFACTORY_USER:-${ARTIFACTORY_USER:-}}"
-SCAN_ART_TOKEN="${XRAY_ARTIFACTORY_TOKEN:-${ARTIFACTORY_TOKEN:-}}"
-SCAN_ART_PASSWORD="${XRAY_ARTIFACTORY_PASSWORD:-${ARTIFACTORY_PASSWORD:-}}"
+# PREFER the normal ARTIFACTORY_* creds — Xray almost always lives on the
+# same Artifactory you push to, so one cred set is all you need. The
+# XRAY_ARTIFACTORY_* vars are an OPTIONAL fallback for the rare case where
+# the Xray-side Artifactory differs from the push-side (e.g. scanning on a
+# Pro/cloud instance while pushing to a local one); set them only then.
+SCAN_ART_URL="${ARTIFACTORY_URL:-${XRAY_ARTIFACTORY_URL:-}}"
+SCAN_ART_USER="${ARTIFACTORY_USER:-${XRAY_ARTIFACTORY_USER:-}}"
+SCAN_ART_TOKEN="${ARTIFACTORY_TOKEN:-${XRAY_ARTIFACTORY_TOKEN:-}}"
+SCAN_ART_PASSWORD="${ARTIFACTORY_PASSWORD:-${XRAY_ARTIFACTORY_PASSWORD:-}}"
 ART_SECRET="${SCAN_ART_TOKEN:-${SCAN_ART_PASSWORD}}"
 if [ -z "${SCAN_ART_URL}" ] || [ -z "${SCAN_ART_USER}" ] || [ -z "${ART_SECRET}" ]; then
   echo "→ xray-vuln: Xray-side Artifactory creds unset — no-op"

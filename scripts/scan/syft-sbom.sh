@@ -63,6 +63,9 @@ cd "${PROJECT_ROOT}"
 import_bamboo_vars
 load_image_env
 
+# Self-source build.env (latest IMAGE_DIGEST) so build.sh→scan needs no manual sourcing. See README "Running the scripts manually".
+[ -f build.env ] && { set -a; . ./build.env; set +a; }
+
 # ── Resolve scan target ─────────────────────────────────────────────
 SBOM_TARGET="$(printf '%s' "${SBOM_TARGET:-image}" | tr '[:upper:]' '[:lower:]')"
 SCAN_REF="${1:-${SBOM_SCAN_REF:-}}"

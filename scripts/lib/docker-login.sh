@@ -14,16 +14,32 @@
 # Provides one function:
 #
 #   docker_login_for_xray_scan
-#     Attempts a non-fatal docker login against three potential hosts:
+#     Attempts a non-fatal docker login against the hosts it has creds
+#     for:
 #     - HARBOR_REGISTRY                (default Harbor backend)
-#     - ARTIFACTORY_PUSH_HOST        (when REGISTRY_KIND=artifactory_jcr|artifactory_pro)
-#     - XRAY_ARTIFACTORY_URL host    (when scan-side ≠ push-side)
+#     - ARTIFACTORY_PUSH_HOST          (REGISTRY_KIND=artifactory_jcr|artifactory_pro)
+#     - the UPSTREAM host              (pull side) — see resolution below
+#
+#     Upstream pull-auth resolution (decoupled from the push side):
+#       1. explicit UPSTREAM_REGISTRY_USER + UPSTREAM_REGISTRY_PASSWORD
+#          (token ok) → used for ANY host (private mirror, Docker Hub /
+#          ghcr / quay account, …);
+#       2. else ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD, but ONLY
+#          when the upstream host shares ARTIFACTORY_URL's domain (the
+#          "upstream is our own Artifactory mirror" case — existing forks
+#          that set only ARTIFACTORY_* keep working, no migration);
+#       3. else none → anonymous pull. Artifactory creds are NEVER sent
+#          to a public registry (docker.io / ghcr / quay / …).
 #
 #     Each login is independent: failure of one doesn't block the
 #     others. Hosts without configured creds are silently skipped.
 #     A failed individual login logs WARN but continues — public
 #     images (e.g. docker.io/library/* for prescan) are still
 #     pullable without auth.
+#
+#     NOTE: the function name is historical (it predates syft-sbom +
+#     non-Xray scanners); it is the shared multi-registry login used by
+#     every scan/build job, not Xray-specific.
 #
 # Why a separate lib instead of doing this inline:
 #   - build.sh has its own narrower _build_docker_login that targets
@@ -76,32 +92,53 @@ docker_login_for_xray_scan() {
     fi
   fi
 
-  # ── UPSTREAM_REGISTRY host (e.g. internal Docker Hub mirror) ─────
-  # When UPSTREAM_REGISTRY points at the same Artifactory that hosts
-  # the push target (path-based pulls through a remote repo), we still
-  # need to login to its host SEPARATELY — docker daemon keeps per-host
-  # credentials and the push-host login at ARTIFACTORY_PUSH_HOST
-  # (typically a subdomain like docker.artifactory.example.com)
-  # doesn't grant access to the API host (artifactory.example.com).
-  # Skipped when UPSTREAM_REGISTRY's host matches one already logged
-  # into above, or when ARTIFACTORY_USER/secret unavailable.
-  if [ -n "${UPSTREAM_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
-    local _ups_host="${UPSTREAM_REGISTRY%%/*}"
-    local _secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
-    if [ -n "${_secret}" ] \
-       && [ "${_ups_host}" != "${HARBOR_REGISTRY:-}" ] \
-       && [ "${_ups_host}" != "${ARTIFACTORY_PUSH_HOST:-}" ]; then
-      _attempts=$((_attempts + 1))
-      echo "→ docker login ${_ups_host} (UPSTREAM_REGISTRY host)"
-      if printf '%s' "${_secret}" \
-           | docker login "${_ups_host}" -u "${ARTIFACTORY_USER}" --password-stdin >/dev/null 2>/tmp/docker-login.err; then
-        echo "  ✓ logged in"
-      else
-        echo "  WARN: login failed — ${_ups_host} pulls will be unauthenticated" >&2
-        sed 's/^/    /' /tmp/docker-login.err >&2 || true
-        _failures=$((_failures + 1))
-      fi
+  # ── Upstream registry pull auth (explicit-wins, safe fallback) ───
+  # Logging in to pull the BASE image is decoupled from the push side.
+  # Credential resolution for the upstream host:
+  #   1. explicit UPSTREAM_REGISTRY_USER + UPSTREAM_REGISTRY_PASSWORD
+  #      (PASSWORD accepts a token) — used for ANY host. This is the
+  #      flexible knob: private mirror, Docker Hub / ghcr / quay account.
+  #   2. else ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD — but ONLY
+  #      when the upstream host is in the SAME domain as ARTIFACTORY_URL
+  #      (the common "upstream is our own Artifactory mirror" case, so
+  #      existing forks that only set ARTIFACTORY_* keep working with no
+  #      migration). NEVER sent to a public registry.
+  #   3. else none → anonymous pull (public / anonymous-pull registries).
+  # Host comes from UPSTREAM_REGISTRY (legacy) or the single-URL
+  # UPSTREAM_REF. Skipped when already logged in above (push host / Harbor).
+  local _ups_ref="${UPSTREAM_REGISTRY:-${UPSTREAM_REF:-}}"
+  local _ups_host="${_ups_ref%%/*}"
+  local _ups_user="" _ups_pass="" _ups_src=""
+  if [ -n "${UPSTREAM_REGISTRY_USER:-}" ] && [ -n "${UPSTREAM_REGISTRY_PASSWORD:-}" ]; then
+    _ups_user="${UPSTREAM_REGISTRY_USER}"; _ups_pass="${UPSTREAM_REGISTRY_PASSWORD}"; _ups_src="UPSTREAM_REGISTRY_USER"
+  elif [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${_ups_host}" ]; then
+    local _art_secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+    local _art_host="${ARTIFACTORY_URL#*://}"; _art_host="${_art_host%%/*}"
+    local _art_apex=""
+    [ -n "${_art_host}" ] && _art_apex="$(printf '%s' "${_art_host}" | rev | cut -d. -f1,2 | rev)"
+    if [ -n "${_art_secret}" ] && [ -n "${_art_host}" ]; then
+      case "${_ups_host}" in
+        "${_art_host}"|"${_art_apex}"|*".${_art_apex}")
+          _ups_user="${ARTIFACTORY_USER}"; _ups_pass="${_art_secret}"; _ups_src="ARTIFACTORY_USER (same domain)" ;;
+      esac
     fi
+  fi
+  if [ -n "${_ups_host}" ] && [ -n "${_ups_user}" ] && [ -n "${_ups_pass}" ] \
+     && [ "${_ups_host}" != "${HARBOR_REGISTRY:-}" ] \
+     && [ "${_ups_host}" != "${ARTIFACTORY_PUSH_HOST:-}" ]; then
+    _attempts=$((_attempts + 1))
+    echo "→ docker login ${_ups_host} (upstream — ${_ups_src})"
+    if printf '%s' "${_ups_pass}" \
+         | docker login "${_ups_host}" -u "${_ups_user}" --password-stdin >/dev/null 2>/tmp/docker-login.err; then
+      echo "  ✓ logged in"
+    else
+      echo "  WARN: login failed — ${_ups_host} pulls will be unauthenticated" >&2
+      sed 's/^/    /' /tmp/docker-login.err >&2 || true
+      _failures=$((_failures + 1))
+    fi
+  elif [ -n "${_ups_host}" ]; then
+    [ "${BUILD_DEBUG:-false}" = "true" ] && \
+      echo "  [debug] no upstream creds for ${_ups_host} (not in Artifactory domain, no UPSTREAM_REGISTRY_USER) — anonymous pull" >&2
   fi
 
   # NOTE: we deliberately DO NOT attempt docker login against

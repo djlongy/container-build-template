@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─── DO NOT EDIT — template lib (deletable) ────────────────────────
-# Bamboo support is OPT-OUT: delete this file + bamboo-specs/bamboo.yaml
+# Bamboo support is OPT-OUT: delete this file + bamboo-specs/bamboo.yml
 # to remove. load-image-env.sh provides a no-op stub when absent.
 # ───────────────────────────────────────────────────────────────────
 #
@@ -10,9 +10,8 @@
 # absent — load-image-env.sh's stub of `import_bamboo_vars` is a
 # no-op when this file isn't sourced. Removing Bamboo support is:
 #
-#   rm bamboo-specs/bamboo.yaml
+#   rm bamboo-specs/bamboo.yml
 #   rm scripts/lib/bamboo-import.sh
-#   (optional) rm bamboo-related scenarios from scripts/test/regression.sh
 #
 # Nothing else needs to change.
 #
@@ -22,7 +21,7 @@
 # as env vars prefixed `bamboo_` (dots in the var name become
 # underscores). This script translates each `bamboo_FOO` to a bare
 # `FOO` export before image.env loading, so plan vars Just Work
-# without per-var relay shims in bamboo.yaml.
+# without per-var relay shims in bamboo.yml.
 #
 # Doesn't override an already-set bare var — explicit shell export
 # wins over Bamboo plan-var auto-import. Use that to keep a
@@ -30,7 +29,7 @@
 #
 # For renamed vars (e.g. shared global `svc_artifactory_token` →
 # script-expected `ARTIFACTORY_TOKEN`), still write a one-line shim
-# in the bamboo.yaml task — auto-import only handles exact-match.
+# in the bamboo.yml task — auto-import only handles exact-match.
 
 # shellcheck disable=SC2148
 # (sourced, not executed — no shebang interpretation needed)

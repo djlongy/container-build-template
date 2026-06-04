@@ -100,9 +100,9 @@ Build:
             # bypasses.
             if [ "${bamboo_FORCE_ALL:-false}" != "true" ]; then
               CHANGED=$(git diff --name-only HEAD~1 HEAD \
-                -- image.env image.env.example Dockerfile.example inject-certs.sh install-ca-certificates.sh scripts/ certs/ bamboo-specs/bamboo.yaml 2>/dev/null \
+                -- image.env image.env.example Dockerfile.example inject-certs.sh install-ca-certificates.sh scripts/ certs/ bamboo-specs/bamboo.yml 2>/dev/null \
                 || git diff --name-only HEAD \
-                -- image.env image.env.example Dockerfile.example inject-certs.sh install-ca-certificates.sh scripts/ certs/ bamboo-specs/bamboo.yaml)
+                -- image.env image.env.example Dockerfile.example inject-certs.sh install-ca-certificates.sh scripts/ certs/ bamboo-specs/bamboo.yml)
               if [ -z "$CHANGED" ]; then
                 echo "No image-relevant changes — skipping"
                 echo "SKIP=true" > build.env
@@ -116,8 +116,9 @@ Build:
             # build.sh auto-imports every bamboo_* as the bare name.
             # The exports below cover ONLY the cases where the shared
             # global has a different name (svc_*) than build.sh expects.
-            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
             export HARBOR_USER="${bamboo_svc_harbor_user:-${bamboo_HARBOR_USER:-}}"
             export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
 
@@ -138,16 +139,35 @@ Build:
               export PATH="${HOME}/.local/bin:${PATH}"
             fi
 
-            # Write ~/.docker/config.json so docker / syft / crane can
-            # authenticate to UPSTREAM_REGISTRY (internal mirrors).
-            # Safe no-op when ARTIFACTORY_* / UPSTREAM_REGISTRY unset.
-            if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ] && [ -n "${UPSTREAM_REGISTRY:-}" ]; then
-              _host="${UPSTREAM_REGISTRY%%/*}"
-              AUTH=$(printf '%s:%s' "${ARTIFACTORY_USER}" "${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')
+            # Write ~/.docker/config.json so docker/syft/crane can pull
+            # the BASE image. Same upstream-auth resolution as
+            # scripts/lib/docker-login.sh: explicit UPSTREAM_REGISTRY_* →
+            # else same-domain ARTIFACTORY_* → else anonymous (creds never
+            # go to a public registry).
+            _UPS_REF="${UPSTREAM_REGISTRY:-${UPSTREAM_REF:-}}"
+            _UPS_HOST="${_UPS_REF%%/*}"
+            _UPS_USER=""; _UPS_PASS=""; _UPS_SRC=""
+            if [ -n "${UPSTREAM_REGISTRY_USER:-}" ] && [ -n "${UPSTREAM_REGISTRY_PASSWORD:-}" ]; then
+              _UPS_USER="${UPSTREAM_REGISTRY_USER}"; _UPS_PASS="${UPSTREAM_REGISTRY_PASSWORD}"; _UPS_SRC="UPSTREAM_REGISTRY_USER"
+            elif [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${_UPS_HOST}" ]; then
+              _ART_SECRET="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+              _ART_HOST="${ARTIFACTORY_URL#*://}"; _ART_HOST="${_ART_HOST%%/*}"
+              _ART_APEX=$(printf '%s' "${_ART_HOST}" | rev | cut -d. -f1,2 | rev)
+              if [ -n "${_ART_SECRET}" ] && [ -n "${_ART_HOST}" ]; then
+                case "${_UPS_HOST}" in
+                  "${_ART_HOST}"|"${_ART_APEX}"|*".${_ART_APEX}")
+                    _UPS_USER="${ARTIFACTORY_USER}"; _UPS_PASS="${_ART_SECRET}"; _UPS_SRC="ARTIFACTORY_USER (same domain)" ;;
+                esac
+              fi
+            fi
+            if [ -n "${_UPS_HOST}" ] && [ -n "${_UPS_USER}" ] && [ -n "${_UPS_PASS}" ]; then
+              AUTH=$(printf '%s:%s' "${_UPS_USER}" "${_UPS_PASS}" | base64 | tr -d '\n')
               mkdir -p "${HOME}/.docker"
-              printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${_host}" "${AUTH}" > "${HOME}/.docker/config.json"
+              printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${_UPS_HOST}" "${AUTH}" > "${HOME}/.docker/config.json"
               chmod 600 "${HOME}/.docker/config.json"
-              echo "→ wrote ~/.docker/config.json for ${_host}"
+              echo "→ wrote ~/.docker/config.json for ${_UPS_HOST} (${_UPS_SRC})"
+            else
+              echo "→ no upstream creds for ${_UPS_HOST:-<none>} — base image pulled anonymously"
             fi
 
             # Branch-aware push: main/master pushes; feature branches
@@ -210,7 +230,7 @@ Syft SBOM Prescan:
         scripts:
           - |-
             . ./image.env
-            export SBOM_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+            export SBOM_SCAN_REF="${UPSTREAM_REF}"
             bash ./scripts/scan/syft-sbom.sh
   artifacts:
     - name: sbom-prescan
@@ -241,8 +261,9 @@ Grype Vuln:
 
             # Optional Grype DB mirror auth — needed only when
             # ARTIFACTORY_GRYPE_DB_REPO is set in image.env.
-            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
 
             # Set GRYPE_FAIL_ON_SEVERITY="Critical" (or "Critical,High")
             # in image.env / plan vars to make this a hard gate.
@@ -267,8 +288,9 @@ Grype DB Sync:
         scripts:
           - |-
 
-            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
 
             # `|| true` mirrors GitLab's optional-job semantics. Drop
             # the suffix to fail loudly on missing mirror config.
@@ -299,12 +321,13 @@ Xray Vuln Prescan:
         scripts:
           - |-
 
-            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 
             . ./image.env
-            export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+            export XRAY_SCAN_REF="${UPSTREAM_REF}"
             bash ./scripts/scan/xray-vuln.sh
   artifacts:
     - name: xray-scan-prescan
@@ -322,12 +345,13 @@ Xray SBOM Prescan:
         scripts:
           - |-
 
-            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 
             . ./image.env
-            export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+            export XRAY_SCAN_REF="${UPSTREAM_REF}"
             bash ./scripts/scan/xray-sbom.sh
   artifacts:
     - name: xray-sbom-prescan
@@ -353,8 +377,9 @@ Xray Vuln Postscan:
             set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
-            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 
             # IMAGE_DIGEST is in env from build.env — script auto-resolves.
@@ -381,8 +406,9 @@ Xray SBOM Postscan:
             set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
-            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 
             bash ./scripts/scan/xray-sbom.sh
@@ -410,7 +436,7 @@ Xray SBOM Postscan:
 #         scripts:
 #           - |-
 #             . ./image.env
-#             export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#             export TRIVY_SCAN_REF="${UPSTREAM_REF}"
 #             bash ./scripts/scan/trivy-vuln.sh
 #   artifacts:
 #     - name: vuln-scan-trivy-prescan
@@ -428,7 +454,7 @@ Xray SBOM Postscan:
 #         scripts:
 #           - |-
 #             . ./image.env
-#             export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#             export TRIVY_SCAN_REF="${UPSTREAM_REF}"
 #             bash ./scripts/scan/trivy-sbom.sh
 #   artifacts:
 #     - name: sbom-trivy-prescan
@@ -561,8 +587,19 @@ SBOM Ingest:
             set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
-            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            # Ingest only on the default branch (mirrors GitLab's
+            # `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` rule). Feature
+            # branches build + scan (pipeline still completes green) but
+            # do NOT post — only main pushes a real artifact, so only main
+            # ships results to the sinks (no duplicate/upstream Splunk noise).
+            case "${bamboo_planRepository_branchName:-}" in
+              main|master) : ;;
+              *) echo "→ Ingest skipped on non-default branch '${bamboo_planRepository_branchName:-?}' — only main/master posts to sinks"; exit 0 ;;
+            esac
+
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
             export DEPENDENCY_TRACK_API_KEY="${bamboo_svc_dependency_track_api_key:-${bamboo_DEPENDENCY_TRACK_API_KEY:-}}"
             export SBOM_WEBHOOK_AUTH_HEADER="${bamboo_svc_sbom_webhook_auth_header:-${bamboo_SBOM_WEBHOOK_AUTH_HEADER:-}}"
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
@@ -586,8 +623,16 @@ Vuln Ingest:
             set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
-            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            # Ingest only on the default branch (mirrors GitLab). Feature
+            # branches build + scan but do NOT post — see Sbom Ingest note.
+            case "${bamboo_planRepository_branchName:-}" in
+              main|master) : ;;
+              *) echo "→ Ingest skipped on non-default branch '${bamboo_planRepository_branchName:-?}' — only main/master posts to sinks"; exit 0 ;;
+            esac
+
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
             export VULN_WEBHOOK_AUTH_HEADER="${bamboo_svc_vuln_webhook_auth_header:-${bamboo_VULN_WEBHOOK_AUTH_HEADER:-}}"
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 

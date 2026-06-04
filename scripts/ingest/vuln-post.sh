@@ -85,7 +85,7 @@ case "${VULN_SCAN_FILE}" in
   /*) ;;
   *)  VULN_SCAN_FILE="$(pwd)/${VULN_SCAN_FILE}" ;;
 esac
-[ -f "${VULN_SCAN_FILE}" ] || { echo "ERROR: vuln scan not found: ${VULN_SCAN_FILE}" >&2; exit 1; }
+[ -s "${VULN_SCAN_FILE}" ] || { echo "ERROR: vuln scan missing or empty: ${VULN_SCAN_FILE}" >&2; exit 1; }
 
 _TMP=$(mktemp -d)
 trap 'rm -rf "${_TMP}"' EXIT

@@ -286,8 +286,8 @@ def collect_artifacts_and_dependencies(tmpdir, file_count, tag_subpath, repo,
         # Filter orphans: skip sha256 blobs not referenced by this
         # push's manifest. manifest.json itself always passes (no
         # digest comparison applies). When the referenced set is empty
-        # (manifest fetch failed), preserve legacy "count everything"
-        # behavior to avoid silently dropping data.
+        # (manifest fetch failed), fall back to counting everything so
+        # we don't silently drop data.
         if referenced and fname.startswith("sha256__"):
             digest = _filename_to_digest(fname)
             if digest not in referenced:

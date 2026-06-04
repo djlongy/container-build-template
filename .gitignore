@@ -63,3 +63,6 @@ xray-sbom.cdx.json
 __pycache__/
 *.pyc
 .venv/
+
+# Regression suite — internal only, never published to the public mirror
+scripts/test/

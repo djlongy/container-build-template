@@ -351,9 +351,9 @@ _artifactory_jcr_fetch_manifests_for_merge() {
   # is already on PATH (build.sh installs it for the BASE_DIGEST OCI
   # label resolution), so no new dependency.
   #
-  # Falls through to the legacy curl-then-walk path if crane is
-  # somehow missing — that path still works for upstreams hosted in
-  # the same Artifactory as the push target (proxy / remote repo).
+  # Falls through to the curl-then-walk path if crane is missing —
+  # that path works for upstreams hosted in the same Artifactory as
+  # the push target (proxy / remote repo).
   if command -v crane >/dev/null 2>&1; then
     if crane config "${UPSTREAM_REF}" 2>/dev/null \
          | python3 -c "
@@ -367,7 +367,7 @@ json.dump(cfg.get('rootfs', {}).get('diff_ids', []), sys.stdout)" \
     rm -f "${tmpdir}/upstream-diffids.json"
   fi
 
-  # ── Fallback: legacy curl path ────────────────────────────────────
+  # ── Fallback: curl path ───────────────────────────────────────────
   # Works when upstream is on the same Artifactory as the push (proxy
   # repos with our auth). Doesn't work for direct public docker.io
   # without bearer-auth handling — that's covered by the crane branch.

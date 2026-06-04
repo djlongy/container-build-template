@@ -40,11 +40,13 @@
 #
 # Scan target resolution (highest precedence first):
 #   1. positional arg $1
-#   2. XRAY_SCAN_REF env var (explicit override)
-#   3. IMAGE_DIGEST   (from build.env — the rebuilt image's digest)
-#   4. IMAGE_REF      (from build.env — the rebuilt image's tag)
-#   5. UPSTREAM_REF   (from image.env — the upstream we rebuilt from)
-#   6. UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG (assembled if all set)
+#   2. XRAY_SCAN_REF env var (Xray-specific override)
+#   3. SBOM_SCAN_REF env var (generic SBOM-producer override — shared
+#      with syft-sbom.sh / trivy-sbom.sh)
+#   4. IMAGE_DIGEST   (from build.env — the rebuilt image's digest)
+#   5. IMAGE_REF      (from build.env — the rebuilt image's tag)
+#   6. UPSTREAM_REF   (from image.env — the upstream we rebuilt from)
+#   7. UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG (assembled if all set)
 #
 # Default targets the BUILT image — same reasoning as xray-vuln.sh.
 # Pair with that script as the postscan stage of your pipeline.
@@ -78,6 +80,9 @@ cd "${PROJECT_ROOT}"
 import_bamboo_vars
 load_image_env
 
+# Self-source build.env (latest IMAGE_DIGEST) so build.sh→scan needs no manual sourcing. See README "Running the scripts manually".
+[ -f build.env ] && { set -a; . ./build.env; set +a; }
+
 # Opt-out gate
 if [ "${XRAY_GENERATE_SBOM:-true}" = "false" ]; then
   echo "→ XRAY_GENERATE_SBOM=false — skipping Xray SBOM generation"
@@ -85,7 +90,10 @@ if [ "${XRAY_GENERATE_SBOM:-true}" = "false" ]; then
 fi
 
 # ── Resolve scan target (mirrors xray-vuln.sh's chain) ────────────
-SCAN_REF="${1:-${XRAY_SCAN_REF:-}}"
+# XRAY_SCAN_REF is the Xray-specific override; SBOM_SCAN_REF is the
+# generic SBOM-producer override honoured by syft-sbom.sh and
+# trivy-sbom.sh too, so swapping SBOM producers needs only one var.
+SCAN_REF="${1:-${XRAY_SCAN_REF:-${SBOM_SCAN_REF:-}}}"
 if [ -z "${SCAN_REF}" ]; then
   if   [ -n "${IMAGE_DIGEST:-}" ];                                          then SCAN_REF="${IMAGE_DIGEST}"
   elif [ -n "${IMAGE_REF:-}" ];                                             then SCAN_REF="${IMAGE_REF}"
@@ -96,17 +104,20 @@ if [ -z "${SCAN_REF}" ]; then
 fi
 if [ -z "${SCAN_REF}" ]; then
   echo "ERROR: no scan target available." >&2
-  echo "  Resolution chain: \$1 > XRAY_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF > UPSTREAM_REGISTRY/IMAGE:TAG" >&2
+  echo "  Resolution chain: \$1 > XRAY_SCAN_REF > SBOM_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF > UPSTREAM_REGISTRY/IMAGE:TAG" >&2
   exit 1
 fi
 echo "→ Scan target: ${SCAN_REF}"
-_dbg "(resolution: \$1=${1:-} XRAY_SCAN_REF=${XRAY_SCAN_REF:-} IMAGE_DIGEST=${IMAGE_DIGEST:-} IMAGE_REF=${IMAGE_REF:-} UPSTREAM_REF=${UPSTREAM_REF:-})"
+_dbg "(resolution: \$1=${1:-} XRAY_SCAN_REF=${XRAY_SCAN_REF:-} SBOM_SCAN_REF=${SBOM_SCAN_REF:-} IMAGE_DIGEST=${IMAGE_DIGEST:-} IMAGE_REF=${IMAGE_REF:-} UPSTREAM_REF=${UPSTREAM_REF:-})"
 
 # ── Phase 1 preconditions: scan-side Artifactory creds ────────────
-SCAN_ART_URL="${XRAY_ARTIFACTORY_URL:-${ARTIFACTORY_URL:-}}"
-SCAN_ART_USER="${XRAY_ARTIFACTORY_USER:-${ARTIFACTORY_USER:-}}"
-SCAN_ART_TOKEN="${XRAY_ARTIFACTORY_TOKEN:-${ARTIFACTORY_TOKEN:-}}"
-SCAN_ART_PASSWORD="${XRAY_ARTIFACTORY_PASSWORD:-${ARTIFACTORY_PASSWORD:-}}"
+# PREFER the normal ARTIFACTORY_* creds (Xray usually shares the push
+# Artifactory). XRAY_ARTIFACTORY_* is an OPTIONAL fallback for a separate
+# Xray-side instance — set those only when scan-side ≠ push-side.
+SCAN_ART_URL="${ARTIFACTORY_URL:-${XRAY_ARTIFACTORY_URL:-}}"
+SCAN_ART_USER="${ARTIFACTORY_USER:-${XRAY_ARTIFACTORY_USER:-}}"
+SCAN_ART_TOKEN="${ARTIFACTORY_TOKEN:-${XRAY_ARTIFACTORY_TOKEN:-}}"
+SCAN_ART_PASSWORD="${ARTIFACTORY_PASSWORD:-${XRAY_ARTIFACTORY_PASSWORD:-}}"
 ART_SECRET="${SCAN_ART_TOKEN:-${SCAN_ART_PASSWORD}}"
 if [ -z "${SCAN_ART_URL}" ] || [ -z "${SCAN_ART_USER}" ] || [ -z "${ART_SECRET}" ]; then
   echo "→ xray-sbom: Xray-side Artifactory creds unset — no-op"

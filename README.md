@@ -38,13 +38,13 @@ cp Dockerfile.example                  Dockerfile
 cp image.env.example                   image.env  &&  $EDITOR image.env
 cp inject-certs.sh install-ca-certificates.sh  .
 cp .gitignore .dockerignore            .
-cp .gitlab-ci.yml                      .       # or bamboo-specs/bamboo.yaml
+cp .gitlab-ci.yml                      .       # or bamboo-specs/bamboo.yml
 mkdir -p certs/                                # populate at build time
 ```
 
 The CI YAML clones the template at job time and runs its scripts
 against your `image.env` + `Dockerfile`. See `software/prometheus`
-or a sibling consumer repo for working examples.
+or `software/redis` in the homelab for working examples.
 
 ## Quick start (self-build)
 
@@ -87,6 +87,7 @@ ignores its namespace entirely).
 | `HARBOR_PASSWORD` | `REGISTRY_KIND=harbor` |
 | `ARTIFACTORY_TOKEN` *or* `ARTIFACTORY_PASSWORD` | `REGISTRY_KIND=artifactory_jcr` or `artifactory_pro` |
 | `XRAY_ARTIFACTORY_TOKEN` | scan-side Artifactory differs from push-side |
+| `UPSTREAM_REGISTRY_PASSWORD` (+ `UPSTREAM_REGISTRY_USER`) | base-image pull needs auth for a NON-Artifactory upstream (Docker Hub / ghcr / quay account, or a foreign private mirror). Accepts a token. **Not needed when the upstream is your own Artifactory mirror** — `ARTIFACTORY_*` creds are reused automatically for same-domain hosts. Unset = anonymous pull |
 | `SPLUNK_HEC_TOKEN` | shipping events to Splunk |
 | `DEPENDENCY_TRACK_API_KEY` | shipping SBOMs to Dependency-Track |
 | `SBOM_WEBHOOK_AUTH_HEADER` | generic SBOM webhook needs auth |
@@ -98,7 +99,52 @@ Plus 3 CI-runtime images that YAML reads at pipeline-load time
 
 **Bare-minimum to push via Artifactory**: export `ARTIFACTORY_USER`
 and `ARTIFACTORY_TOKEN`, set everything else in `image.env`, then
-`./scripts/build.sh --push`. The backend handles its own docker login.
+`./scripts/build.sh --push`. The backend handles its own docker login
+to the push target. Pulling the *base* image is separate: when the
+upstream is your own Artifactory mirror (same domain as
+`ARTIFACTORY_URL`), the `ARTIFACTORY_*` creds are reused automatically —
+nothing extra to set. For a non-Artifactory upstream that needs auth
+(Docker Hub / ghcr / quay account, foreign mirror) set
+`UPSTREAM_REGISTRY_USER` + `UPSTREAM_REGISTRY_PASSWORD`; those win for
+any host. Public / anonymous upstreams need neither. Artifactory creds
+are never sent to a public registry.
+
+## Running the scripts manually (handover-friendly)
+
+Every script is self-contained — run them **one after another, no manual
+`source` step**:
+
+```bash
+bash scripts/build.sh --push          # writes build.env
+bash scripts/scan/syft-sbom.sh        # self-sources build.env → scans the image just built
+bash scripts/scan/grype-vuln.sh
+bash scripts/ingest/sbom-post.sh      # self-sources build.env → ships with the right scanned_image
+```
+
+The scan + ingest scripts **self-source `./build.env`**, so they always
+target the **latest** build (a second `--push` is scanned at its new
+digest — no stale-digest failures). You do **not** need
+`set -a; . ./build.env; set +a`.
+
+**Overriding the scan target** — the only manual step. `IMAGE_REF` /
+`IMAGE_DIGEST` are *build outputs* owned by `build.env`; exporting them is
+ignored (build.env wins). To point a scan elsewhere, use the override
+knobs, which outrank build.env:
+
+```bash
+bash scripts/scan/xray-vuln.sh registry/img:tag    # positional arg — always wins
+export XRAY_SCAN_REF=registry/img:tag              # (or SBOM_SCAN_REF / TRIVY_SCAN_REF)
+```
+
+Resolution order: `arg > <tool>_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF`.
+
+**Reproducibility / no-git:** the image digest is reproducible **per git
+commit** (`SOURCE_DATE_EPOCH` = commit time), so re-pushing the same commit
+is an idempotent overwrite. Without git (e.g. files copied to a bare dir)
+the build still works but uses a wall-clock timestamp — not reproducible —
+and a moving tag (`APPEND_GIT_SHORT=false`) across commits can still
+re-push to a new digest; the self-sourcing scan stays correct either way
+because it reads the current `build.env`.
 
 ## Pipeline flow
 
@@ -118,6 +164,13 @@ Every scan job is single-purpose and parallel within its stage.
 Swap script names to swap producers — downstream stages keep working
 because they consume canonical `${SBOM_FILE}` / `${VULN_SCAN_FILE}`
 from `build.env`.
+
+**Branch behaviour:** feature/MR branches build (no push) and scan
+(postscan falls back to `UPSTREAM_REF` since nothing was pushed), so the
+pipeline completes green for the merge gate — but the **`ingest` stage
+runs only on the default branch + tags**. Only `main` pushes a real
+artifact, so only `main` ships results to the sinks; feature branches
+don't post duplicate upstream events to Splunk/Artifactory.
 
 `cosign-sign` is dormant (commented blocks in both CI files). Restore
 by uncommenting the job AND the `- sign` stage entry, then setting
@@ -195,6 +248,14 @@ The OCI `org.opencontainers.image.version` label is also set to
 `<UPSTREAM_TAG>-<gitShort>` so tools can tell at a glance that this
 is a rebuild, not the upstream.
 
+**Reproducible digests.** The build clock is anchored to the git
+commit time via `SOURCE_DATE_EPOCH` (BuildKit clamps layer + config
+timestamps), so rebuilding the *same commit* produces the *same*
+image digest. A re-push of the same tag is therefore an idempotent
+overwrite to the identical digest — it never orphans the previous
+digest, so a postscan job that scans `IMAGE_DIGEST` from `build.env`
+keeps resolving. Set `SOURCE_DATE_EPOCH` explicitly to override.
+
 ## OCI labels
 
 `build.sh` adds dynamic labels via `docker buildx build --label`.
@@ -204,7 +265,7 @@ Upstream labels (e.g. `maintainer`) flow through untouched.
 |---|---|
 | `org.opencontainers.image.version` / `.ref.name` | `${UPSTREAM_TAG}-${gitShort}` |
 | `org.opencontainers.image.revision` | `git rev-parse HEAD` |
-| `org.opencontainers.image.created` | `date -u` at build time |
+| `org.opencontainers.image.created` | git commit time of `HEAD` via `SOURCE_DATE_EPOCH` (reproducible; override with `SOURCE_DATE_EPOCH`, falls back to wall-clock only without git) |
 | `org.opencontainers.image.base.name` | `UPSTREAM_REF` (the full upstream URL) |
 | `org.opencontainers.image.base.digest` | `crane digest` of the upstream ref |
 | `org.opencontainers.image.source` / `.url` | `CI_PROJECT_URL` / git remote |
@@ -262,10 +323,9 @@ container-build-template/
 │   │   ├── syft-sbom.sh   │   xray-sbom.sh   │   trivy-sbom.sh   (dormant)
 │   │   └── grype-vuln.sh  │   xray-vuln.sh   │   trivy-vuln.sh   (dormant)
 │   ├── ingest/sbom-post.sh    # 5 SBOM sinks
-│   ├── sync/mirror-grype-db.sh # Mirror Anchore Grype DB to Artifactory
-│   └── test/regression.sh     # 50+ scenarios — bash scripts/test/regression.sh
+│   └── sync/mirror-grype-db.sh # Mirror Anchore Grype DB to Artifactory
 ├── .gitlab-ci.yml             # GitLab pipeline — prescan → build → postscan → ingest
-├── bamboo-specs/bamboo.yaml   # Bamboo plan spec (1:1 parity with GitLab)
+├── bamboo-specs/bamboo.yml   # Bamboo plan spec (1:1 parity with GitLab)
 ├── .gitignore  └  LICENSE  └  README.md
 ```
 
@@ -292,23 +352,6 @@ export ARTIFACTORY_USER='svc-deploy' ARTIFACTORY_TOKEN='...'
 # Verbose:
 BUILD_DEBUG=true ./scripts/build.sh --dry-run
 ```
-
-## Local regression testing
-
-Before pushing changes that touch `build.sh`, `scan/*`, `ingest/sbom-post.sh`,
-or `lib/*`:
-
-```bash
-bash scripts/test/regression.sh                  # full suite
-bash scripts/test/regression.sh registry-kind    # filter by name substring
-```
-
-50+ scenarios covering: cert sidecar behaviour + CA_CERT
-materialisation, ORIGINAL_USER auto-detect via crane, APPEND_GIT_SHORT
-toggle, required-field validation, argv handling, REGISTRY_KIND
-backend dispatch, HARBOR_* / ARTIFACTORY_* independence, bamboo_*
-auto-import, canonical artifact names propagation, scan-target
-resolution chain, and the silent-fail regression.
 
 ## License
 

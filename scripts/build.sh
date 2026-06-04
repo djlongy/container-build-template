@@ -19,20 +19,10 @@
 #   remote manifest digest.
 #
 # Usage:
-#   ./scripts/build.sh                        # build only, load into local daemon
-#   ./scripts/build.sh --push                 # build + push via REGISTRY_KIND backend
-#   ./scripts/build.sh --dry-run              # resolve config + digest, no build
-#   ./scripts/build.sh --project-root <dir>   # per-image repo root (image.env,
-#                                             #   Dockerfile, certs/); default $PWD
-#   ./scripts/build.sh --env-file <path>      # alternate image.env, e.g. a
-#                                             #   dev/prod variant; default
-#                                             #   $PROJECT_ROOT/image.env
-#   ./scripts/build.sh --dockerfile <path>    # alternate Dockerfile;
-#                                             #   default ./Dockerfile
-#   ./scripts/build.sh --help                 # full flag list
-#
-#   Flags combine in any order. --help / _build_print_usage carries the
-#   authoritative per-flag descriptions.
+#   ./scripts/build.sh            # build only, load into local daemon
+#   ./scripts/build.sh --push     # build + push via REGISTRY_KIND backend
+#   ./scripts/build.sh --dry-run  # resolve config + digest, no build
+#   ./scripts/build.sh --help     # full flag list
 #
 # Required env when --push:
 #   REGISTRY_KIND       "harbor" (default) | "artifactory_jcr" | "artifactory_pro"
@@ -136,11 +126,6 @@ Usage: ./scripts/build.sh [flags]
                            Set when invoking from a repo whose Dockerfile
                            lives under a different name (e.g. the template
                            repo's self-build uses Dockerfile.example).
-  --no-cache               Pass --no-cache to docker build/buildx, forcing
-                           every stage to rebuild from scratch (ignores the
-                           layer cache). Use to bypass a stale/corrupt local
-                           cache or to guarantee a fresh pull of upstream
-                           layers. Slower; no effect on the pushed artifact.
   --help, -h               This message.
 
   Flags can appear in any order. Without --push or --dry-run, build
@@ -182,7 +167,6 @@ EOF
 _build_parse_args() {
   WANT_PUSH=0
   WANT_DRY_RUN=0
-  WANT_NO_CACHE=0
   IMAGE_ENV_FILE=""
   DOCKERFILE="Dockerfile"
 
@@ -193,7 +177,6 @@ _build_parse_args() {
     case "$1" in
       --push)         WANT_PUSH=1; shift ;;
       --dry-run)      WANT_DRY_RUN=1; shift ;;
-      --no-cache)     WANT_NO_CACHE=1; shift ;;
       --project-root)
         if [ $# -lt 2 ] || [ -z "$2" ]; then
           echo "ERROR: --project-root requires a path argument" >&2
@@ -335,8 +318,8 @@ _build_apply_defaults_and_normalise() {
   #   UPSTREAM_REF="docker.io/library/nginx:1.25.3-alpine"
   # Decompose it into the registry/image/tag parts that the rest of the
   # build (and the Dockerfile build-args) consume. Explicit per-segment
-  # vars still win as overrides, and the legacy three-var form (no
-  # UPSTREAM_REF at all) keeps working unchanged.
+  # vars override the decomposed values, and setting them directly
+  # without UPSTREAM_REF works too.
   if [ -n "${UPSTREAM_REF:-}" ]; then
     _build_decompose_upstream_ref "${UPSTREAM_REF}"
     UPSTREAM_REGISTRY="${UPSTREAM_REGISTRY:-${_REF_HOST}}"
@@ -381,6 +364,12 @@ _build_apply_defaults_and_normalise() {
 # The upstream tag IS the semver; the git SHA differentiates builds
 # of the same upstream version. No internal version axis.
 
+# Portable epoch → ISO8601 UTC (GNU `date -d @N`, BSD/macOS `date -r N`).
+_build_epoch_to_iso() {
+  date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -r "$1"  +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
+}
+
 _build_compute_tag() {
   if ! git rev-parse HEAD >/dev/null 2>&1; then
     GIT_SHA="unknown"
@@ -389,7 +378,36 @@ _build_compute_tag() {
     GIT_SHA=$(git rev-parse HEAD)
     GIT_SHORT=$(git rev-parse --short=7 HEAD)
   fi
-  CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  # ── Reproducible build timestamp (SOURCE_DATE_EPOCH) ──────────────
+  # Two consecutive `--push` of the SAME commit must produce the SAME
+  # image digest. The only thing that used to differ between runs was
+  # CREATED=$(date now), which fed org.opencontainers.image.created and
+  # (via BuildKit) the image config's own timestamps — so each build
+  # got a fresh manifest digest, the re-push ORPHANED the previous
+  # digest in the registry, and any scan still holding that digest
+  # failed immediately ("manifest not found").
+  #
+  # Fix: anchor the build clock to the git COMMIT time. BuildKit honours
+  # SOURCE_DATE_EPOCH (clamps layer + config timestamps), so identical
+  # source → identical digest, and a re-push is a no-op overwrite to the
+  # same digest (nothing orphaned). Precedence:
+  #   1. SOURCE_DATE_EPOCH already in env  → respected (CI override)
+  #   2. git committer date of HEAD        → reproducible per commit
+  #   3. wall clock (no git)               → last resort, non-reproducible
+  if [ -z "${SOURCE_DATE_EPOCH:-}" ] && [ "${GIT_SHA}" != "unknown" ]; then
+    SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD 2>/dev/null || echo "")
+  fi
+  if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+    SOURCE_DATE_EPOCH=$(date -u +%s)
+    _dbg "no git commit time available — SOURCE_DATE_EPOCH=now (build not reproducible)"
+  fi
+  # NOT exported globally — passed inline to the buildx command in
+  # _build_docker_build instead, so it can't leak into the caller's shell
+  # and silently pin a later same-shell run's timestamp. BuildKit reads it
+  # from that command's environment all the same.
+  CREATED=$(_build_epoch_to_iso "${SOURCE_DATE_EPOCH}")
+  _dbg "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} → CREATED=${CREATED}"
 
   # APPEND_GIT_SHORT controls whether the pushed tag carries the
   # git short SHA. Default true (build differentiation matters when
@@ -479,8 +497,8 @@ _build_resolve_push_target() {
 #
 # Convention: each push-backends/<kind>.sh exposes a `${kind}_require_env`
 # function (no leading underscore — it's part of the public contract).
-# build.sh sources the backend AND `_${kind}_require_env` (legacy name)
-# also works for backward compat.
+# build.sh sources the backend and calls that function; an underscore-
+# prefixed `_${kind}_require_env` is also accepted.
 _build_validate_backend() {
   [ "${WANT_PUSH}" -eq 1 ] || return 0
 
@@ -496,8 +514,8 @@ _build_validate_backend() {
   # shellcheck disable=SC1090
   . "${backend}"
 
-  # Try public name first (kind_require_env), then legacy private
-  # name (_kind_require_env), then no-op if neither exists.
+  # Try the public name (kind_require_env) first, then the underscore-
+  # prefixed _kind_require_env, then no-op if neither exists.
   local fn
   for fn in "${kind}_require_env" "_${kind}_require_env"; do
     if declare -f "${fn}" >/dev/null 2>&1; then
@@ -753,30 +771,17 @@ _build_docker_build() {
   # We don't consume buildx's provenance/SBOM attestations — Xray
   # covers provenance separately and Syft/Trivy/Xray + sbom-post.sh
   # cover SBOMs as their own stages — so disabling them is lossless.
-  # --no-cache passthrough. Valid for both the buildx and classic
-  # `docker build` invocations. Forces every stage (incl. the cert
-  # sidecar) to rebuild rather than reuse cached layers.
-  local cache_args=()
-  if [ "${WANT_NO_CACHE:-0}" -eq 1 ]; then
-    cache_args+=(--no-cache)
-    echo "→ --no-cache: rebuilding all stages, ignoring layer cache"
-  fi
-
   local _build_cmd=(docker build)
   if docker buildx version >/dev/null 2>&1; then
     _build_cmd=(docker buildx build --provenance=false --sbom=false --load)
     echo "→ docker buildx build (provenance/sbom disabled)"
   else
-    # No buildx plugin → fall back to plain `docker build` (legacy builder).
-    # We deliberately do NOT force DOCKER_BUILDKIT=1 here: on engines where the
-    # BuildKit component isn't installed, setting it makes `docker build` hard-
-    # fail ("buildkit not supported by daemon" / component not installed)
-    # instead of falling back — so it breaks the very runners that lack buildx.
-    # Plain legacy `docker build` is the safe, universally-available path.
-    echo "→ docker build (buildx not detected — legacy builder, flat manifest by default)"
+    echo "→ docker build (buildx not detected — flat manifest by default)"
   fi
-  "${_build_cmd[@]}" \
-    "${cache_args[@]}" \
+  # SOURCE_DATE_EPOCH is passed INLINE (command-scoped) rather than
+  # exported, so BuildKit clamps layer/config timestamps for a
+  # reproducible digest without the value leaking into the caller's shell.
+  SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" "${_build_cmd[@]}" \
     "${build_args[@]}" "${label_args[@]}" -t "${FULL_IMAGE}" \
     -f "${DOCKERFILE}" .
   echo "→ build complete: ${FULL_IMAGE}"
@@ -899,6 +904,19 @@ _build_materialise_certs
 _build_resolve_push_target
 _build_validate_backend          # fail-fast on missing HARBOR_*/ARTIFACTORY_*
 
+# Docker logins for ALL registries we might pull from (the upstream
+# host, HARBOR_REGISTRY, ARTIFACTORY_PUSH_HOST). MUST run BEFORE base
+# digest + USER resolution: crane reads ~/.docker/config.json, so an
+# auth-protected upstream mirror needs the login in place first — else
+# `crane digest` (base.digest label) and `crane config` (ORIGINAL_USER
+# auto-detect) both 403 anonymously, silently emptying base.digest and
+# defaulting the final USER to root. The push backend still does its
+# own login for the push target later. Upstream pull login is opt-in
+# (UPSTREAM_REGISTRY_USER + UPSTREAM_REGISTRY_PASSWORD) — see docker-login.sh.
+# shellcheck source=lib/docker-login.sh
+. "${TEMPLATE_ROOT}/scripts/lib/docker-login.sh"
+docker_login_for_xray_scan || true
+
 _build_print_config_report
 _build_resolve_base_digest
 _build_resolve_upstream_user
@@ -906,17 +924,10 @@ _build_resolve_upstream_user
 # --dry-run stops here: config resolved, digest fetched, USER probed.
 if [ "${WANT_DRY_RUN}" -eq 1 ]; then
   echo "→ --dry-run: stopping before docker build"
+  echo "  NOTE: build.env was NOT written/refreshed by --dry-run. A scan run"
+  echo "        now would read any PRE-EXISTING build.env (possibly stale)."
   exit 0
 fi
-
-# Docker logins for ALL registries we might pull from (UPSTREAM_REGISTRY
-# host, HARBOR_REGISTRY, ARTIFACTORY_PUSH_HOST). Push backend does its
-# own login for the push target later — this covers the PULL side so
-# the upcoming docker build can fetch the base image through an
-# auth-protected internal mirror.
-# shellcheck source=lib/docker-login.sh
-. "${TEMPLATE_ROOT}/scripts/lib/docker-login.sh"
-docker_login_for_xray_scan || true
 
 _build_docker_build
 _build_emit_local_build_env      # always — feature branches need this too

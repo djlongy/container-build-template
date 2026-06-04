@@ -31,9 +31,11 @@
 #                           vars don't (so a stray `VAR=` in the agent
 #                           env can't clobber the file value).
 #                           Snapshot list is AUTO-DERIVED from image.env
-#                           (greps `^[# ]*VAR=` patterns) plus a small
-#                           EXTRAS list for shell-only vars — adding a
-#                           new var to image.env is one-place edit.
+#                           (greps `^[# ]*VAR=` patterns) — adding a var
+#                           to image.env is a one-place edit, no hardcoded
+#                           list to maintain. Shell/CI-only vars (build.env
+#                           outputs, secrets) need no entry: image.env
+#                           can't clobber what it doesn't set.
 #
 # Centralising means each script self-loads its config — same precedence
 # everywhere, same debug logs everywhere, same "fail with clear hint"
@@ -81,7 +83,7 @@ _redact_value() {
 # The actual Bamboo auto-import logic lives in a SEPARATE file
 # (scripts/lib/bamboo-import.sh) so the codebase remains modular —
 # Bamboo support can be removed by deleting that one file plus
-# bamboo-specs/bamboo.yaml. The stub below provides a safe no-op
+# bamboo-specs/bamboo.yml. The stub below provides a safe no-op
 # function when bamboo-import.sh isn't present, so callers that do
 # `import_bamboo_vars` keep working unchanged.
 _bamboo_lib="$(dirname "${BASH_SOURCE[0]}")/bamboo-import.sh"
@@ -101,7 +103,7 @@ unset _bamboo_lib
 #   1. explicit $1 argument
 #   2. ${IMAGE_ENV_FILE} env var (set by build.sh --env-file)
 #   3. ${PROJECT_ROOT}/image.env (per-image repo when invoked via clone)
-#   4. ./image.env relative to CWD (legacy single-repo callers)
+#   4. ./image.env relative to CWD (callers run from the repo root)
 # Fails fast with a hint when nothing exists.
 #
 # Three-step:
@@ -135,8 +137,8 @@ load_image_env() {
     echo "" >&2
     echo "  image.env is the single source of truth for this build." >&2
     echo "  image.env.example is a TEMPLATE — it is NOT sourced as a" >&2
-    echo "  fallback (was previously, but that masked config drift" >&2
-    echo "  between dev local edits and CI's untouched template)." >&2
+    echo "  fallback, because that would mask config drift between" >&2
+    echo "  local edits and CI's untouched template." >&2
     echo "" >&2
     echo "  To fix:" >&2
     echo "    cp image.env.example image.env" >&2
@@ -149,37 +151,28 @@ load_image_env() {
   fi
 
   # ── Build the snapshot list ─────────────────────────────────────
-  # Auto-derive from image.env itself by grepping every line that
-  # mentions a `VAR=` (active or commented). That way ADDING A NEW
-  # VAR TO image.env IS A ONE-PLACE EDIT — no need to also update
-  # this loader. Only true for vars that exist in image.env (the
-  # one file actually sourced); image.env.example is a template
-  # only and is intentionally NOT scanned.
+  # Auto-derive PURELY from image.env by grepping every line that
+  # mentions a `VAR=` (active or commented — only the NAME is taken;
+  # commented lines are never sourced for their value). That way
+  # ADDING A NEW VAR TO image.env IS A ONE-PLACE EDIT — no hardcoded
+  # list to maintain here. (image.env.example is a template and is
+  # intentionally NOT scanned.)
   #
-  # Augmented with an EXTRAS list for vars that flow only via shell
-  # / CI (never appear in image.env as a `VAR=` line) but still need
-  # shell-precedence over file values when they DO get set:
-  #   - CA_CERT (CI-only secret)
-  #   - IMAGE_REF / IMAGE_DIGEST / IMAGE_TAG / UPSTREAM_REF
-  #     (build.env outputs / build.sh derived values)
-  #   - SBOM_SCAN_REF / TRIVY_SCAN_REF / TRIVY_SEVERITY_FILTER
-  #     (scan-time overrides documented in scan-script docstrings)
-  #   - XRAY_ARTIFACTORY_PASSWORD (alternative to TOKEN, masked CI var)
-  #   - XRAY_SCAN_FORMAT (scan-time override)
-  # Add to EXTRAS when a new var is ONLY set in shell/CI, never in image.env.
-  local __extras="CA_CERT \
-                  IMAGE_REF IMAGE_DIGEST IMAGE_TAG UPSTREAM_REF \
-                  SBOM_SCAN_REF TRIVY_SCAN_REF TRIVY_SEVERITY_FILTER \
-                  XRAY_ARTIFACTORY_PASSWORD XRAY_SCAN_FORMAT"
-
+  # No supplementary list is needed: this snapshot exists only to make
+  # a shell/CI value WIN over an image.env value for the SAME var.
+  # Vars that live only in the shell/CI and never in image.env
+  # (build.env outputs like IMAGE_REF/IMAGE_DIGEST, secrets like
+  # CA_CERT, scan-time overrides, ALLOW_TRIVY) need no entry here:
+  # image.env can't clobber what it doesn't set, so their shell value
+  # already survives sourcing untouched. They simply won't appear in
+  # the "→ Loaded config" listing below — each script logs its own
+  # resolved target/inputs anyway.
   local __v __line __SHELL_OVERRIDES=""
   local __known
   __known=$(
-    {
-      grep -oE '^[# ]*[A-Z][A-Z0-9_]+=' "${__env_file}" 2>/dev/null \
-        | sed -E 's/^[# ]*//; s/=$//'
-      printf '%s\n' ${__extras}
-    } | sort -u
+    grep -oE '^[# ]*[A-Z][A-Z0-9_]+=' "${__env_file}" 2>/dev/null \
+      | sed -E 's/^[# ]*//; s/=$//' \
+      | sort -u
   )
   for __v in ${__known}; do
     if [ -n "${!__v-}" ]; then

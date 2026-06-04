@@ -184,17 +184,35 @@ variables:
       unset _IMG_KEYS _IMG_SNAP _v _line _rk _rv _rdec
     fi
   - |
-    # Write ~/.docker/config.json so syft / crane / docker daemon can
-    # authenticate to UPSTREAM_REGISTRY without needing `docker login`
-    # (alpine scan jobs have no dind). Safe no-op when ARTIFACTORY_*
-    # creds or UPSTREAM_REGISTRY are unset.
-    if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ] && [ -n "${UPSTREAM_REGISTRY:-}" ]; then
-      _host="${UPSTREAM_REGISTRY%%/*}"
-      AUTH=$(printf '%s:%s' "${ARTIFACTORY_USER}" "${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')
+    # Write ~/.docker/config.json so syft/crane can pull the BASE image
+    # in dind-less scan jobs. Same upstream-auth resolution as
+    # scripts/lib/docker-login.sh: explicit UPSTREAM_REGISTRY_* → else
+    # same-domain ARTIFACTORY_* → else anonymous (creds never go to a
+    # public registry). See README "Required CI variables".
+    _UPS_REF="${UPSTREAM_REGISTRY:-${UPSTREAM_REF:-}}"
+    _UPS_HOST="${_UPS_REF%%/*}"
+    _UPS_USER=""; _UPS_PASS=""; _UPS_SRC=""
+    if [ -n "${UPSTREAM_REGISTRY_USER:-}" ] && [ -n "${UPSTREAM_REGISTRY_PASSWORD:-}" ]; then
+      _UPS_USER="${UPSTREAM_REGISTRY_USER}"; _UPS_PASS="${UPSTREAM_REGISTRY_PASSWORD}"; _UPS_SRC="UPSTREAM_REGISTRY_USER"
+    elif [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${_UPS_HOST}" ]; then
+      _ART_SECRET="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+      _ART_HOST="${ARTIFACTORY_URL#*://}"; _ART_HOST="${_ART_HOST%%/*}"
+      _ART_APEX=$(printf '%s' "${_ART_HOST}" | rev | cut -d. -f1,2 | rev)
+      if [ -n "${_ART_SECRET}" ] && [ -n "${_ART_HOST}" ]; then
+        case "${_UPS_HOST}" in
+          "${_ART_HOST}"|"${_ART_APEX}"|*".${_ART_APEX}")
+            _UPS_USER="${ARTIFACTORY_USER}"; _UPS_PASS="${_ART_SECRET}"; _UPS_SRC="ARTIFACTORY_USER (same domain)" ;;
+        esac
+      fi
+    fi
+    if [ -n "${_UPS_HOST}" ] && [ -n "${_UPS_USER}" ] && [ -n "${_UPS_PASS}" ]; then
+      AUTH=$(printf '%s:%s' "${_UPS_USER}" "${_UPS_PASS}" | base64 | tr -d '\n')
       mkdir -p "${HOME}/.docker"
-      printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${_host}" "${AUTH}" > "${HOME}/.docker/config.json"
+      printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${_UPS_HOST}" "${AUTH}" > "${HOME}/.docker/config.json"
       chmod 600 "${HOME}/.docker/config.json"
-      echo "→ wrote ~/.docker/config.json for ${_host}"
+      echo "→ wrote ~/.docker/config.json for ${_UPS_HOST} (${_UPS_SRC})"
+    else
+      echo "→ no upstream creds for ${_UPS_HOST:-<none>} — base image pulled anonymously"
     fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -271,7 +289,7 @@ syft-sbom-prescan:
     - *install-tools
   script:
     - |
-      export SBOM_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+      export SBOM_SCAN_REF="${UPSTREAM_REF}"
       bash ./scripts/scan/syft-sbom.sh
   artifacts:
     paths:
@@ -376,7 +394,7 @@ xray-vuln-prescan:
   needs: []      # no build artifacts — scans UPSTREAM_REF
   script:
     - |
-      export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+      export XRAY_SCAN_REF="${UPSTREAM_REF}"
       bash ./scripts/scan/xray-vuln.sh
   artifacts:
     paths:
@@ -390,7 +408,7 @@ xray-sbom-prescan:
   needs: []
   script:
     - |
-      export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+      export XRAY_SCAN_REF="${UPSTREAM_REF}"
       bash ./scripts/scan/xray-sbom.sh
   artifacts:
     paths:
@@ -451,7 +469,7 @@ xray-sbom-postscan:
 #     - *install-tools
 #   script:
 #     - |
-#       export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#       export TRIVY_SCAN_REF="${UPSTREAM_REF}"
 #       bash ./scripts/scan/trivy-vuln.sh
 #   artifacts:
 #     paths:
@@ -468,7 +486,7 @@ xray-sbom-postscan:
 #     - *install-tools
 #   script:
 #     - |
-#       export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#       export TRIVY_SCAN_REF="${UPSTREAM_REF}"
 #       bash ./scripts/scan/trivy-sbom.sh
 #   artifacts:
 #     paths:

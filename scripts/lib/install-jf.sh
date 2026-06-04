@@ -7,7 +7,7 @@
 # install-jf.sh — single source of truth for JFrog CLI installation.
 #
 # Sourced by scripts/build.sh, scripts/push-backends/artifactory_common.sh,
-# bamboo-specs/bamboo.yaml, and .gitlab-ci.yml. Keeping the install
+# bamboo-specs/bamboo.yml, and .gitlab-ci.yml. Keeping the install
 # logic in one place means the "no sudo" + "honour internal mirror"
 # policy is consistent everywhere.
 #

@@ -120,7 +120,7 @@ case "${SBOM_FILE}" in
   /*) ;;
   *)  SBOM_FILE="$(pwd)/${SBOM_FILE}" ;;
 esac
-[ -f "${SBOM_FILE}" ] || { echo "ERROR: SBOM file not found: ${SBOM_FILE}" >&2; exit 1; }
+[ -s "${SBOM_FILE}" ] || { echo "ERROR: SBOM file missing or empty: ${SBOM_FILE}" >&2; exit 1; }
 
 _TMP=$(mktemp -d)
 trap 'rm -rf "${_TMP}"' EXIT
@@ -364,7 +364,13 @@ else
   echo "→ splunk-hec           POST ${SPLUNK_HEC_URL}"
   rc=0
   (
-    image_ref="${IMAGE_REF:-${UPSTREAM_REGISTRY:-}/${UPSTREAM_IMAGE:-}:${UPSTREAM_TAG:-}}"
+    # IMAGE_REF (from build.env) is the rebuilt/pushed ref; fall back to
+    # the single-URL UPSTREAM_REF (image.env), then a literal "unknown".
+    # NB: do NOT reconstruct from ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}
+    # — those are only ever populated inside build.sh, so under the
+    # single-URL UPSTREAM_REF config they're empty and the old fallback
+    # collapsed to the bogus literal "/:". Mirrors vuln-post.sh.
+    image_ref="${IMAGE_REF:-${UPSTREAM_REF:-unknown}}"
     git_sha="${GIT_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
     jq -nc \
       --arg sbom_file "${SBOM_FILE##*/}" \

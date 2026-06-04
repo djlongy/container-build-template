@@ -64,6 +64,9 @@ cd "${PROJECT_ROOT}"
 import_bamboo_vars
 load_image_env
 
+# Self-source build.env (canonical SBOM_FILE/VULN_SCAN_FILE) so build.sh→scan needs no manual sourcing. See README "Running the scripts manually".
+[ -f build.env ] && { set -a; . ./build.env; set +a; }
+
 # ── Resolve input SBOM ─────────────────────────────────────────────
 SBOM_IN="${1:-${SBOM_FILE}}"
 case "${SBOM_IN}" in
