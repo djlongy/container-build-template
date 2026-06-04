@@ -767,25 +767,13 @@ _build_docker_build() {
     _build_cmd=(docker buildx build --provenance=false --sbom=false --load)
     echo "→ docker buildx build (provenance/sbom disabled)"
   else
-    # No buildx plugin → we fall back to plain `docker build`. Force the
-    # BuildKit backend via DOCKER_BUILDKIT=1 so the build does NOT use the
-    # legacy graph-driver builder.
-    #
-    # WHY: the legacy builder stages multi-stage intermediate layers as
-    # dangling images in the shared daemon's graph driver. On a long-lived
-    # / shared CI runner those layers can be GC'd out from under an
-    # in-flight build (a concurrent job's `docker image prune`, a
-    # housekeeping cron, or a corrupt layerdb left by a prior interrupted
-    # build). When the final stage hits `COPY --from=certs-source ...` the
-    # builder then dies with "failed to find layer sha256:..." — even
-    # though the same Dockerfile builds cleanly on a quiet local daemon.
-    # BuildKit keeps its own content-addressed cache that `docker image
-    # prune` can't touch, so it is immune to this race. DOCKER_BUILDKIT=1
-    # works on any engine >= 18.09 (no buildx plugin required) and still
-    # produces a flat single manifest by default, matching the build-info
-    # merger's expectations.
-    export DOCKER_BUILDKIT=1
-    echo "→ docker build with DOCKER_BUILDKIT=1 (buildx not detected; BuildKit avoids the legacy 'failed to find layer' race)"
+    # No buildx plugin → fall back to plain `docker build` (legacy builder).
+    # We deliberately do NOT force DOCKER_BUILDKIT=1 here: on engines where the
+    # BuildKit component isn't installed, setting it makes `docker build` hard-
+    # fail ("buildkit not supported by daemon" / component not installed)
+    # instead of falling back — so it breaks the very runners that lack buildx.
+    # Plain legacy `docker build` is the safe, universally-available path.
+    echo "→ docker build (buildx not detected — legacy builder, flat manifest by default)"
   fi
   "${_build_cmd[@]}" \
     "${cache_args[@]}" \
