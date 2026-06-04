@@ -14,6 +14,11 @@
 # so build.sh → scan needs no manual `. build.env`. Requires
 # TEMPLATE_ROOT + PROJECT_ROOT already exported by the caller.
 scan_bootstrap() {
+  # Capture operator-set output filenames BEFORE artifact-names.sh defaults
+  # them, so an explicit shell/CI override survives the build.env self-source
+  # below (build.env carries the canonical names and would otherwise clobber
+  # them — defeating distinct per-producer outputs in a multi-scanner run).
+  local __sbom_override="${SBOM_FILE:-}" __vuln_override="${VULN_SCAN_FILE:-}"
   # shellcheck source=./load-image-env.sh
   . "${TEMPLATE_ROOT}/scripts/lib/load-image-env.sh"
   # shellcheck source=./artifact-names.sh
@@ -21,6 +26,10 @@ scan_bootstrap() {
   import_bamboo_vars
   load_image_env
   if [ -f build.env ]; then set -a; . ./build.env; set +a; fi
+  # build.env supplies build OUTPUTS (IMAGE_DIGEST/IMAGE_REF/…); but an
+  # explicitly-overridden output FILENAME wins over its canonical default.
+  [ -n "${__sbom_override}" ] && export SBOM_FILE="${__sbom_override}"
+  [ -n "${__vuln_override}" ] && export VULN_SCAN_FILE="${__vuln_override}"
   return 0   # never let a falsy build.env test trip the caller's `set -e`
 }
 
