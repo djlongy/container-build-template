@@ -30,8 +30,9 @@
 # Optional env:
 #   SBOM_FILE                 input CycloneDX SBOM (default: sbom.cdx.json)
 #   VULN_SCAN_FILE            output path (default: vuln-scan.json)
-#   GRYPE_INSTALLER_URL       installer URL (default: GitHub raw)
-#   GRYPE_VERSION             default v0.82.0
+#   GRYPE_INSTALLER_URL       installer URL — .sh installer OR .tar.gz release
+#                             (auto-detected; default: GitHub raw install.sh)
+#   GRYPE_VERSION             default v0.114.0 (used only for the .sh installer)
 #   GRYPE_DB_UPDATE_URL       override CVE DB source (air-gap mirror)
 #   GRYPE_FAIL_ON_SEVERITY    comma-separated severities that trigger
 #                             exit 2 (case-insensitive — Critical,
@@ -81,18 +82,46 @@ case "${VULN_SCAN_FILE}" in
 esac
 
 # ── Auto-install grype ─────────────────────────────────────────────
+# Two installer sources, auto-detected by the GRYPE_INSTALLER_URL suffix:
+#   *.sh             → upstream install.sh, piped to sh (GRYPE_VERSION pins the
+#                      release tag; install.sh selects the right OS/arch binary)
+#   *.tar.gz | *.tgz → a grype release archive; the binary is extracted from it
+#                      (its version is whatever the URL points at, so
+#                      GRYPE_VERSION is not used). Use this for air-gapped /
+#                      Artifactory mirrors that vendor the release tarball.
 if ! command -v grype >/dev/null 2>&1; then
   _url="${GRYPE_INSTALLER_URL:-https://raw.githubusercontent.com/anchore/grype/main/install.sh}"
-  _ver="${GRYPE_VERSION:-v0.82.0}"
-  echo "→ grype not on PATH — installing ${_ver} from ${_url}"
-  mkdir -p "${HOME}/.local/bin"
-  if curl -fsSL --max-time 120 "${_url}" \
-       | sh -s -- -b "${HOME}/.local/bin" "${_ver}" >/dev/null 2>&1 \
-     && [ -x "${HOME}/.local/bin/grype" ]; then
-    export PATH="${HOME}/.local/bin:${PATH}"
+  _ver="${GRYPE_VERSION:-v0.114.0}"
+  _bindir="${HOME}/.local/bin"
+  echo "→ grype not on PATH — installing from ${_url}"
+  mkdir -p "${_bindir}"
+  _ok=0
+  case "${_url}" in
+    *.tar.gz|*.tgz)
+      echo "  (tar.gz release archive)"
+      _tmp="$(mktemp -d)"
+      if curl -fsSL --max-time 120 "${_url}" -o "${_tmp}/grype.tgz" \
+         && tar -xzf "${_tmp}/grype.tgz" -C "${_tmp}"; then
+        _bin="$(find "${_tmp}" -type f -name grype | head -1)"
+        if [ -n "${_bin}" ] && install -m 0755 "${_bin}" "${_bindir}/grype"; then
+          _ok=1
+        fi
+      fi
+      rm -rf "${_tmp}"
+      ;;
+    *)
+      echo "  (install.sh, version ${_ver})"
+      if curl -fsSL --max-time 120 "${_url}" \
+           | sh -s -- -b "${_bindir}" "${_ver}" >/dev/null 2>&1; then
+        _ok=1
+      fi
+      ;;
+  esac
+  if [ "${_ok}" = 1 ] && [ -x "${_bindir}/grype" ]; then
+    export PATH="${_bindir}:${PATH}"
     echo "  ✓ grype installed ($(grype version 2>&1 | head -1))"
   else
-    echo "ERROR: grype install failed — set GRYPE_INSTALLER_URL to a reachable mirror" >&2
+    echo "ERROR: grype install failed — set GRYPE_INSTALLER_URL to a reachable .sh installer or .tar.gz release" >&2
     exit 1
   fi
 fi
