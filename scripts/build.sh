@@ -752,6 +752,9 @@ _build_docker_build() {
 # @sha256 digest. See docs/DESIGN.md "build.env policy on the no-push path".
 
 _build_emit_local_build_env() {
+  # SBOM_FILE / VULN_SCAN_FILE below are filename DECLARATIONS for the
+  # scan stage to read — build.sh does NOT generate these artifacts. The
+  # SBOM/vuln JSON is produced by scripts/scan/*.sh, run after this.
   cat > build.env <<EOF
 IMAGE_REF=${UPSTREAM_REF}
 LOCAL_IMAGE=${FULL_IMAGE}
