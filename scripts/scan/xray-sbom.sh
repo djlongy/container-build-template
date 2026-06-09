@@ -158,6 +158,31 @@ if ! docker pull "${SCAN_REF}" >/dev/null 2>/tmp/xray-sbom-pull.err; then
   exit 1
 fi
 
+# ── Digest refs → re-tag before scanning ───────────────────────────
+# `jf docker scan` indexes by running `docker save <ref>` and feeding
+# the tarball to Xray's indexer. A digest-only ref (repo@sha256:…)
+# saves with RepoTags:null, and the indexer then UNDER-reports — a
+# tiny SBOM instead of the full component graph. Re-tag the pulled
+# image to a local alias so the saved tarball carries a RepoTag; the
+# image id is identical, so this only fixes the naming context. Tag
+# refs pass through unchanged. Prefer IMAGE_REF for a meaningful name.
+SCAN_IMG="${SCAN_REF}"
+XRAY_SCAN_ALIAS=""
+case "${SCAN_REF}" in
+  *@sha256:*)
+    alias_ref="${IMAGE_REF:-}"
+    if [ -z "${alias_ref}" ] || [ "${alias_ref}" = "${SCAN_REF}" ]; then
+      alias_ref="${SCAN_REF%@*}:xray-scan"
+    fi
+    if docker tag "${SCAN_REF}" "${alias_ref}" 2>/dev/null; then
+      echo "→ digest ref → scanning via local tag alias ${alias_ref}"
+      echo "  (digest 'docker save' has RepoTags:null → Xray under-indexes; alias restores it)"
+      SCAN_IMG="${alias_ref}"
+      XRAY_SCAN_ALIAS="${alias_ref}"
+    fi
+    ;;
+esac
+
 # ── Generate SBOM ─────────────────────────────────────────────────
 # SBOM_FILE is the canonical CycloneDX filename (default sbom.cdx.json
 # from scripts/lib/artifact-names.sh; build.env override wins). Treat
@@ -169,14 +194,14 @@ esac
 PROJECT_FLAG=""
 [ -n "${ARTIFACTORY_PROJECT:-}" ] && PROJECT_FLAG="--project=${ARTIFACTORY_PROJECT}"
 
-echo "→ jf docker scan --format=cyclonedx --sbom ${PROJECT_FLAG} ${SCAN_REF}"
+echo "→ jf docker scan --format=cyclonedx --sbom ${PROJECT_FLAG} ${SCAN_IMG}"
 set +e
 # shellcheck disable=SC2086
 jf docker scan ${PROJECT_FLAG} \
   --format=cyclonedx \
   --sbom \
   --fail=false \
-  "${SCAN_REF}" \
+  "${SCAN_IMG}" \
   > "${SBOM_FILE_OUT}" 2>/tmp/xray-sbom.err
 SBOM_RC=$?
 set -e
@@ -209,6 +234,7 @@ fi
 rm -rf /tmp/jfrog.cli.temp.* 2>/dev/null || true
 if command -v docker >/dev/null 2>&1; then
   docker rmi -f "${SCAN_REF}" >/dev/null 2>&1 || true
+  [ -n "${XRAY_SCAN_ALIAS}" ] && docker rmi -f "${XRAY_SCAN_ALIAS}" >/dev/null 2>&1 || true
 fi
 
 # ── Optional inline hand-off to sbom-post.sh (defaults TRUE for Xray) ─
