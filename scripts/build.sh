@@ -683,6 +683,11 @@ _build_docker_build() {
     --build-arg "UPSTREAM_REGISTRY=${UPSTREAM_REGISTRY}"
     --build-arg "UPSTREAM_IMAGE=${UPSTREAM_IMAGE}"
     --build-arg "UPSTREAM_TAG=${UPSTREAM_TAG}"
+    # Same base as one full URL, so a Dockerfile can `FROM ${UPSTREAM_REF}`
+    # instead of the three-part form. Always populated — PHASE 4
+    # re-assembles it from the triple even when image.env supplied
+    # the parts individually rather than UPSTREAM_REF.
+    --build-arg "UPSTREAM_REF=${UPSTREAM_REF}"
     --build-arg "ORIGINAL_USER=${ORIGINAL_USER}"
   )
   # CERT_BUILDER_IMAGE — only pass when set (Dockerfile has a default).

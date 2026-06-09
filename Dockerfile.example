@@ -18,6 +18,13 @@
 ARG UPSTREAM_REGISTRY=docker.io/library
 ARG UPSTREAM_IMAGE=nginx
 ARG UPSTREAM_TAG=1.29.8-alpine
+# UPSTREAM_REF = the same base as ONE full URL (registry/image:tag).
+# build.sh passes BOTH forms — use whichever reads better in your FROM:
+#   FROM ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG} AS base
+#   FROM ${UPSTREAM_REF} AS base
+# Keep this default in sync with the triple above so a bare
+# `docker build .` behaves the same whichever form is used.
+ARG UPSTREAM_REF=docker.io/library/nginx:1.29.8-alpine
 ARG ORIGINAL_USER=root
 ARG CERT_BUILDER_IMAGE=docker.io/library/alpine:3.20
 
