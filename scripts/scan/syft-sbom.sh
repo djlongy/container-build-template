@@ -43,8 +43,9 @@
 #   SBOM_SCAN_REF             override the resolved target (parallels XRAY_SCAN_REF)
 #   SBOM_TARGET               "image" (default) | "source" — switches to dir:${PROJECT_ROOT}
 #   SBOM_FILE                 output path (default sbom.cdx.json — the canonical name)
-#   SYFT_INSTALLER_URL        installer URL (default: GitHub raw)
-#   SYFT_VERSION              default v1.14.0
+#   SYFT_INSTALLER_URL        installer URL — .sh installer OR .tar.gz release
+#                             (auto-detected; default: GitHub raw install.sh)
+#   SYFT_VERSION              default v1.45.1 (used only for the .sh installer)
 #
 # Exit codes: 0 on success (incl. graceful fallbacks); 1 on missing
 # scan target or unrecoverable syft failure.
@@ -73,18 +74,46 @@ fi
 echo "→ Scan target: ${SCAN_REF}"
 
 # ── Auto-install syft ───────────────────────────────────────────────
+# Two installer sources, auto-detected by the SYFT_INSTALLER_URL suffix:
+#   *.sh             → upstream install.sh, piped to sh (SYFT_VERSION pins the
+#                      release tag; install.sh selects the right OS/arch binary)
+#   *.tar.gz | *.tgz → a syft release archive; the binary is extracted from it
+#                      (its version is whatever the URL points at, so
+#                      SYFT_VERSION is not used). Use this for air-gapped /
+#                      Artifactory mirrors that vendor the release tarball.
 if ! command -v syft >/dev/null 2>&1; then
   _url="${SYFT_INSTALLER_URL:-https://raw.githubusercontent.com/anchore/syft/main/install.sh}"
-  _ver="${SYFT_VERSION:-v1.14.0}"
-  echo "→ syft not on PATH — installing ${_ver} from ${_url}"
-  mkdir -p "${HOME}/.local/bin"
-  if curl -fsSL --max-time 120 "${_url}" \
-       | sh -s -- -b "${HOME}/.local/bin" "${_ver}" >/dev/null 2>&1 \
-     && [ -x "${HOME}/.local/bin/syft" ]; then
-    export PATH="${HOME}/.local/bin:${PATH}"
+  _ver="${SYFT_VERSION:-v1.45.1}"
+  _bindir="${HOME}/.local/bin"
+  echo "→ syft not on PATH — installing from ${_url}"
+  mkdir -p "${_bindir}"
+  _ok=0
+  case "${_url}" in
+    *.tar.gz|*.tgz)
+      echo "  (tar.gz release archive)"
+      _tmp="$(mktemp -d)"
+      if curl -fsSL --max-time 120 "${_url}" -o "${_tmp}/syft.tgz" \
+         && tar -xzf "${_tmp}/syft.tgz" -C "${_tmp}"; then
+        _bin="$(find "${_tmp}" -type f -name syft | head -1)"
+        if [ -n "${_bin}" ] && install -m 0755 "${_bin}" "${_bindir}/syft"; then
+          _ok=1
+        fi
+      fi
+      rm -rf "${_tmp}"
+      ;;
+    *)
+      echo "  (install.sh, version ${_ver})"
+      if curl -fsSL --max-time 120 "${_url}" \
+           | sh -s -- -b "${_bindir}" "${_ver}" >/dev/null 2>&1; then
+        _ok=1
+      fi
+      ;;
+  esac
+  if [ "${_ok}" = 1 ] && [ -x "${_bindir}/syft" ]; then
+    export PATH="${_bindir}:${PATH}"
     echo "  ✓ syft installed ($(syft version 2>&1 | head -1))"
   else
-    echo "ERROR: syft install failed — set SYFT_INSTALLER_URL to a reachable mirror" >&2
+    echo "ERROR: syft install failed — set SYFT_INSTALLER_URL to a reachable .sh installer or .tar.gz release" >&2
     exit 1
   fi
 fi
