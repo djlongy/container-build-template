@@ -73,19 +73,35 @@ else
 fi
 echo "→ Scan target: ${SCAN_REF}"
 
-# ── Auto-install syft ───────────────────────────────────────────────
+# ── Auto-install syft (version-pinned, enforced) ───────────────────
 # Two installer sources, auto-detected by the SYFT_INSTALLER_URL suffix:
 #   *.sh             → upstream install.sh, piped to sh (SYFT_VERSION pins the
 #                      release tag; install.sh selects the right OS/arch binary)
-#   *.tar.gz | *.tgz → a syft release archive; the binary is extracted from it
-#                      (its version is whatever the URL points at, so
-#                      SYFT_VERSION is not used). Use this for air-gapped /
-#                      Artifactory mirrors that vendor the release tarball.
-if ! command -v syft >/dev/null 2>&1; then
-  _url="${SYFT_INSTALLER_URL:-https://raw.githubusercontent.com/anchore/syft/main/install.sh}"
-  _ver="${SYFT_VERSION:-v1.45.1}"
-  _bindir="${HOME}/.local/bin"
-  echo "→ syft not on PATH — installing from ${_url}"
+#   *.tar.gz | *.tgz → a syft release archive; the binary is extracted from it.
+#                      The pinned version is read from the URL (syft_X.Y.Z_…).
+#                      Use this for air-gapped / Artifactory mirrors.
+#
+# The pin is ENFORCED, not just "install if missing": a syft already on PATH at
+# a DIFFERENT version (a runner's stale/baked-in build, or an exploited mutable
+# tag) is reinstalled so the pinned version is exactly what runs. We compare the
+# installed `syft version` to the desired version and (re)install on mismatch.
+_url="${SYFT_INSTALLER_URL:-https://raw.githubusercontent.com/anchore/syft/main/install.sh}"
+_ver="${SYFT_VERSION:-v1.45.1}"
+_bindir="${HOME}/.local/bin"
+case "${_url}" in
+  *.tar.gz|*.tgz) _want="$(printf '%s' "${_url##*/}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" ;;
+  *)              _want="${_ver#v}" ;;
+esac
+_have="$(command -v syft >/dev/null 2>&1 && syft version 2>/dev/null | sed -n 's/^Version:[[:space:]]*//p' | head -1 || true)"
+
+if [ -n "${_have}" ] && { [ -z "${_want}" ] || [ "${_have}" = "${_want}" ]; }; then
+  echo "→ syft ${_have} already on PATH${_want:+ (matches pin ${_want})} — skipping install"
+else
+  if [ -n "${_have}" ]; then
+    echo "→ syft ${_have} on PATH but pin is ${_want:-<from URL>} — reinstalling to enforce pin"
+  else
+    echo "→ syft not on PATH — installing ${_want:+v${_want} }from ${_url}"
+  fi
   mkdir -p "${_bindir}"
   _ok=0
   case "${_url}" in
@@ -102,18 +118,23 @@ if ! command -v syft >/dev/null 2>&1; then
       rm -rf "${_tmp}"
       ;;
     *)
-      echo "  (install.sh, version ${_ver})"
+      echo "  (install.sh, version v${_want})"
       if curl -fsSL --max-time 120 "${_url}" \
-           | sh -s -- -b "${_bindir}" "${_ver}" >/dev/null 2>&1; then
+           | sh -s -- -b "${_bindir}" "v${_want}" >/dev/null 2>&1; then
         _ok=1
       fi
       ;;
   esac
-  if [ "${_ok}" = 1 ] && [ -x "${_bindir}/syft" ]; then
-    export PATH="${_bindir}:${PATH}"
-    echo "  ✓ syft installed ($(syft version 2>&1 | head -1))"
-  else
+  if [ "${_ok}" != 1 ] || [ ! -x "${_bindir}/syft" ]; then
     echo "ERROR: syft install failed — set SYFT_INSTALLER_URL to a reachable .sh installer or .tar.gz release" >&2
+    exit 1
+  fi
+  export PATH="${_bindir}:${PATH}"
+  hash -r 2>/dev/null || true
+  _now="$(syft version 2>/dev/null | sed -n 's/^Version:[[:space:]]*//p' | head -1)"
+  echo "  ✓ syft ${_now} installed"
+  if [ -n "${_want}" ] && [ "${_now}" != "${_want}" ]; then
+    echo "ERROR: installed syft ${_now} does not match pinned ${_want}" >&2
     exit 1
   fi
 fi
